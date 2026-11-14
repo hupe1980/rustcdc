@@ -180,13 +180,15 @@ delivery_contract = "at_least_once"   # default
 | Property | Value |
 |---|---|
 | Checkpoint advances | **after** successful delivery |
-| Duplicates on restart | possible (one batch worth) |
+| Duplicates after a crash | possible: what was delivered since the last checkpoint write — at most `runtime.checkpoint_interval_ms` (1 s) or `checkpoint_max_events` (100 000) events |
 | Data gaps | impossible |
 | Compatible sinks | all |
 
-This is the safe default. A crash between delivery and checkpoint write causes
-the last batch to be redelivered. Idempotent consumers (Kafka deduplication,
-upsert sinks) handle this transparently.
+This is the safe default. The checkpoint is written once a second, and the source is only
+told a position once it is written, so a crash replays at most the last second of delivered
+events and loses none. Idempotent consumers (Kafka deduplication,
+upsert sinks) handle this transparently. A clean shutdown writes it first and replays
+nothing. Set `checkpoint_interval_ms = 0` to write per batch, at a throughput cost.
 
 ### `effectively_once`
 

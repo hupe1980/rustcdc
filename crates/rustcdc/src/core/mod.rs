@@ -38,12 +38,12 @@ pub(crate) use row_shape::row_shape_from_parts;
 pub use row_shape::{ROW_SHAPE_DIGEST_VERSION, RowShape, ShapeColumn};
 pub use runtime::write_runtime_metrics_prometheus;
 pub use runtime::{
-    AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, EventBatch,
-    HEALTH_MIN_CONFIGURABLE_STALL_MS, HealthVerdict, IdempotencyOptions, OpenTransaction,
-    PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl,
-    RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState, SlotWalStatus,
-    StallCause, StallOwner, StreamedTransactions, TransactionBoundaryPolicy, TransformErrorPolicy,
-    ValidationErrorPolicy,
+    AckMode, AckToken, CdcRuntime, ConnectionRetryPolicy, DEFAULT_CHECKPOINT_MAX_EVENTS,
+    EventBatch, HEALTH_MIN_CONFIGURABLE_STALL_MS, HealthVerdict, IdempotencyOptions,
+    OpenTransaction, PostCommitSourceConfirmPolicy, RuntimeAdminSnapshot, RuntimeConfig,
+    RuntimeControl, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig, RuntimeState,
+    SlotWalStatus, StallCause, StallOwner, StreamedTransactions, TransactionBoundaryPolicy,
+    TransformErrorPolicy, ValidationErrorPolicy,
 };
 pub use secret::{SecretProvider, SecretString};
 #[cfg(feature = "tls")]

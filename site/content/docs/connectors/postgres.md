@@ -174,7 +174,7 @@ the checkpoint never moves for a transaction that has not committed.
 |---|---|---|
 | While a 10 M-row `UPDATE` runs | The primary spills it to its own disk | The primary sends it; the connector holds it |
 | At its commit | The whole transaction crosses the network | Only the rest crosses |
-| 300 000 updates, last row at Kafka ([measured](@/docs/performance.md)) | +13.1 s after the commit | +10.4 s |
+| 300 000 updates, last row at Kafka ([measured](@/docs/performance.md)) | +8.5 s after the commit | +8.0 s |
 | `pg_stat_replication_slots` | `spill_txns`, `spill_bytes` grow | `stream_txns`, `stream_bytes` grow |
 
 **Where it is held.** In memory up to `stream_buffer_memory_bytes` (64 MiB) across open
@@ -185,8 +185,10 @@ restart. The directory is checked writable when the stream opens; under a read-o
 filesystem, mount an `emptyDir` and point `stream_spill_directory` at it. A full disk stops the
 pipeline with the I/O error; nothing is dropped.
 
-**The limit that does not change.** A committed transaction is still delivered as one unit, so
-its events are held in memory while they are, with or without streaming.
+**The limits that do not change.** A committed transaction is still delivered as one unit, so
+its events are held in memory while they are, with or without streaming. And PostgreSQL cannot
+stream a transaction while a row's TOASTed value is only partly decoded: a transaction whose
+rows carry TOASTed values is mostly spilled on the primary, as under v1.
 
 **What you see meanwhile.** `/status` names the transaction under `source.open_transaction` —
 changes so far, bytes, on disk or not, since when — and the [console](@/docs/console.md) says

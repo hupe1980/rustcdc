@@ -76,8 +76,9 @@ Every command runs from the repository root. `cargo build` builds both crates;
 
 ## Delivery guarantees
 
-- **`at_least_once`** — a crash can replay the events of one uncheckpointed batch.
-  Duplicates are possible; loss is not. Sinks must be idempotent on a key you control.
+- **`at_least_once`** — a crash can replay what was delivered since the last checkpoint write:
+  at most one second by default. Duplicates are possible; loss is not. Sinks must be
+  idempotent on a key you control.
 - **`effectively_once`** — a batch's records and its checkpoint commit together: in one
   Kafka transaction, or against a destination-side offset token where the sink offers one.
   A crash keeps both or neither. It is *not* available in every configuration — the ones

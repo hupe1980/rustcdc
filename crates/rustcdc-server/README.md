@@ -347,7 +347,7 @@ delivery_contract = "effectively_once"  # at_least_once | effectively_once
 
 | Contract | Guarantee | Kafka | HTTP |
 |---|---|---|---|
-| `at_least_once` | Delivered ≥ 1×; checkpoint advances only after durable delivery | ✅ | ✅ |
+| `at_least_once` | Delivered ≥ 1×; checkpoint advances only after durable delivery and is written once a second, so a crash replays at most that second | ✅ | ✅ |
 | `effectively_once` | A batch's records and its checkpoint commit together: in one Kafka transaction, or against the sink's destination-side offset token (Snowflake). A crash keeps both or neither. The Kafka route needs a transactional sink and `state.offset.backend = "kafka_topic"` on the same cluster. It must hold for **every** routed sink; anything that cannot deliver it is rejected at load, naming the sink. [How it works](https://hupe1980.github.io/rustcdc/docs/concepts/#3-delivery-contracts). | ✅ | ❌ |
 
 ---
@@ -467,7 +467,7 @@ rustcdc snapshot public.invoices --admin-write-token-env RUSTCDC_WRITE_TOKEN
 docker pull ghcr.io/hupe1980/rustcdc-server:latest
 
 # Pin to a specific version
-docker pull ghcr.io/hupe1980/rustcdc-server:0.22.0
+docker pull ghcr.io/hupe1980/rustcdc-server:0.23.0
 ```
 
 Images are built on distroless/cc (no shell, no package manager), signed with SLSA provenance, and include a software bill of materials (SBOM). [See the Dockerfile](../../Dockerfile) for build details.

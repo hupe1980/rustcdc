@@ -172,6 +172,24 @@ pub struct RuntimeOptions {
     /// Defaults to [`TransactionBoundaryPolicy::Split`], which matches the behaviour
     /// of every comparable CDC library. See the enum docs for when to change it.
     pub transaction_boundary: TransactionBoundaryPolicy,
+    /// How long an acknowledged position may wait in memory before it is written to the
+    /// checkpoint store and confirmed to the source.
+    ///
+    /// `ZERO` (the default) writes on every [`CdcRuntime::commit_ack`]: when it returns,
+    /// the position is durable. Otherwise `commit_ack` accepts the position in memory, and
+    /// the write happens once the interval has passed — checked on the next commit or poll
+    /// — or once [`checkpoint_max_events`](Self::checkpoint_max_events) events have been
+    /// accepted, and always in [`CdcRuntime::stop`].
+    ///
+    /// **The cost:** a crash replays what was acknowledged since the last write — up to one
+    /// interval or `checkpoint_max_events` events — so a sink sees them twice. The source
+    /// is only ever told a position that is durable, so nothing is lost. A durable write
+    /// per batch is the largest cost on a high-throughput path; Debezium waits 60 s.
+    pub checkpoint_interval: std::time::Duration,
+    /// Accepted events after which the checkpoint is written even within
+    /// [`checkpoint_interval`](Self::checkpoint_interval). Bounds the replay after a crash
+    /// in events as the interval bounds it in time. Default 100 000.
+    pub checkpoint_max_events: u64,
 }
 
 /// Whether a delivered batch may end in the middle of a source transaction.
@@ -245,9 +263,14 @@ impl Default for RuntimeOptions {
             max_event_bytes: None,
             sink_close_timeout_ms: None,
             transaction_boundary: TransactionBoundaryPolicy::Split,
+            checkpoint_interval: std::time::Duration::ZERO,
+            checkpoint_max_events: DEFAULT_CHECKPOINT_MAX_EVENTS,
         }
     }
 }
+
+/// Default for [`RuntimeOptions::checkpoint_max_events`].
+pub const DEFAULT_CHECKPOINT_MAX_EVENTS: u64 = 100_000;
 
 impl RuntimeOptions {
     /// Runtime options with every setting at its default.
@@ -305,6 +328,21 @@ impl RuntimeOptions {
         policy: PostCommitSourceConfirmPolicy,
     ) -> Self {
         self.post_commit_source_confirm_policy = policy;
+        self
+    }
+
+    /// Write the checkpoint at most once per `interval` instead of on every commit.
+    ///
+    /// See [`checkpoint_interval`](RuntimeOptions::checkpoint_interval) for what a crash
+    /// replays in exchange.
+    pub fn with_checkpoint_interval(mut self, interval: std::time::Duration) -> Self {
+        self.checkpoint_interval = interval;
+        self
+    }
+
+    /// Write the checkpoint once this many events are accepted, whatever the interval.
+    pub fn with_checkpoint_max_events(mut self, max_events: u64) -> Self {
+        self.checkpoint_max_events = max_events;
         self
     }
 
@@ -1896,6 +1934,20 @@ impl RuntimeConfig {
         self
     }
 
+    /// Write the checkpoint at most once per `interval`; see
+    /// [`RuntimeOptions::checkpoint_interval`].
+    pub fn with_checkpoint_interval(mut self, interval: std::time::Duration) -> Self {
+        self.options = self.options.with_checkpoint_interval(interval);
+        self
+    }
+
+    /// Write the checkpoint once this many events are accepted; see
+    /// [`RuntimeOptions::checkpoint_max_events`].
+    pub fn with_checkpoint_max_events(mut self, max_events: u64) -> Self {
+        self.options = self.options.with_checkpoint_max_events(max_events);
+        self
+    }
+
     /// Configure transform failure behavior. **Defaults to [`TransformErrorPolicy::Halt`].**
     ///
     /// # Operational Guidance
@@ -2211,9 +2263,39 @@ pub struct CdcRuntime {
     /// Consecutive polls that produced events but had every one suppressed by the
     /// idempotency guard while `pending_confirmation_lsn` was set.
     unconfirmed_stall_polls: u32,
+    /// What `commit_ack` accepted but has not yet made durable; see
+    /// [`RuntimeOptions::checkpoint_interval`].
+    deferred: DeferredCheckpoint,
     /// The row-shape id the schema history last holds, per `schema.table`; see
     /// [`record_row_shape`](CdcRuntime::record_row_shape).
     recorded_shapes: std::collections::HashMap<String, String>,
+}
+
+/// The accepted-but-not-durable tail of the commit path.
+///
+/// Only the latest checkpoint write is kept: each one supersedes the one before, so writing
+/// the last is the same as writing them all.
+struct DeferredCheckpoint {
+    save: Option<(Box<dyn Offset>, u64)>,
+    /// Source position to confirm once `save` is durable — never before.
+    confirmation_lsn: Option<u64>,
+    events: u64,
+    last_durable_at: tokio::time::Instant,
+}
+
+impl DeferredCheckpoint {
+    fn new() -> Self {
+        Self {
+            save: None,
+            confirmation_lsn: None,
+            events: 0,
+            last_durable_at: tokio::time::Instant::now(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.save.is_none() && self.confirmation_lsn.is_none()
+    }
 }
 
 /// Consecutive fully-suppressed polls tolerated before a stalled, unconfirmed
@@ -2432,6 +2514,7 @@ impl CdcRuntime {
             last_checkpoint_saved_at_ms: None,
             pending_confirmation_lsn: None,
             unconfirmed_stall_polls: 0,
+            deferred: DeferredCheckpoint::new(),
             recorded_shapes: std::collections::HashMap::new(),
             transform_pipeline: TransformPipeline::default(),
             idempotency_guard,
@@ -4541,6 +4624,199 @@ mod tests {
             .expect("confirmed lsn mutex should not be poisoned")
             .clone();
         assert_eq!(lsns, vec![0x16_00000000 + 0xB374D848]);
+    }
+
+    // ─── Checkpoint cadence ──────────────────────────────────────────────────
+
+    /// A checkpoint store whose writes can be made to fail, to show the source is not told
+    /// a position that did not become durable.
+    #[cfg(feature = "postgres")]
+    struct SwitchableCheckpoint {
+        inner: InMemoryCheckpoint,
+        failing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(feature = "postgres")]
+    #[async_trait]
+    impl Checkpoint for SwitchableCheckpoint {
+        async fn save(
+            &mut self,
+            offset: &dyn crate::core::Offset,
+            committed_event_count: u64,
+        ) -> crate::core::Result<()> {
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(Error::CheckpointError("simulated store outage".into()));
+            }
+            self.inner.save(offset, committed_event_count).await
+        }
+
+        async fn load(&self) -> crate::core::Result<Option<Box<dyn crate::core::Offset>>> {
+            self.inner.load().await
+        }
+
+        async fn get_committed_count(&self) -> crate::core::Result<u64> {
+            self.inner.get_committed_count().await
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    fn postgres_event(lsn: &str) -> Event {
+        let mut event = event();
+        event.source.source_name = "postgres".into();
+        event.source.offset = lsn.into();
+        event
+    }
+
+    /// A stream-mode runtime over one-event batches at the given LSNs, with the cadence
+    /// set; returns it with its confirmed-LSN log and the store's failure switch.
+    #[cfg(feature = "postgres")]
+    async fn cadence_runtime(
+        lsns: &[&str],
+        interval: std::time::Duration,
+        max_events: u64,
+    ) -> (
+        CdcRuntime,
+        Arc<Mutex<Vec<u64>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let source =
+            MockSource::stream_only(lsns.iter().map(|lsn| vec![postgres_event(lsn)]).collect());
+        let confirmed = source.confirmed_lsns();
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checkpoint = SwitchableCheckpoint {
+            inner: InMemoryCheckpoint::default(),
+            failing: Arc::clone(&failing),
+        };
+        let config = RuntimeConfig::new(
+            RuntimeSourceConfig::Disabled,
+            checkpoint,
+            crate::schema_history::InMemorySchemaHistory::default(),
+        )
+        .with_idempotency_disabled()
+        .with_checkpoint_interval(interval)
+        .with_checkpoint_max_events(max_events);
+        let mut runtime = CdcRuntime::new(config).unwrap();
+        runtime.inject_mock_source(Box::new(source));
+        // A stored position, so the runtime streams rather than snapshots.
+        runtime
+            .config
+            .checkpoint
+            .save(
+                &crate::checkpoint::GenericOffset::new("mock", b"o".to_vec()),
+                0,
+            )
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+        (runtime, confirmed, failing)
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn durable_count(runtime: &CdcRuntime) -> u64 {
+        runtime
+            .config
+            .checkpoint
+            .get_committed_count()
+            .await
+            .unwrap()
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn an_acknowledged_position_waits_for_the_interval_then_is_written_and_confirmed() {
+        let (mut runtime, confirmed, _) = cadence_runtime(
+            &["0/10", "0/20"],
+            std::time::Duration::from_secs(1),
+            100_000,
+        )
+        .await;
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+        assert_eq!(
+            durable_count(&runtime).await,
+            0,
+            "accepted, not yet written"
+        );
+        assert!(
+            confirmed.lock().unwrap().is_empty(),
+            "nothing confirmed before durable"
+        );
+
+        // The interval runs out while nothing is committed: the next poll writes it.
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let batch = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(durable_count(&runtime).await, 1);
+        assert_eq!(*confirmed.lock().unwrap(), vec![0x10]);
+
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+        assert_eq!(durable_count(&runtime).await, 1, "a new interval has begun");
+
+        // Stopping writes what is owed and tells the source.
+        runtime.stop().await.unwrap();
+        assert_eq!(durable_count(&runtime).await, 2);
+        assert_eq!(*confirmed.lock().unwrap(), vec![0x10, 0x20]);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn the_event_cap_writes_within_the_interval() {
+        let (mut runtime, confirmed, _) =
+            cadence_runtime(&["0/10", "0/20"], std::time::Duration::from_secs(3600), 2).await;
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+        assert_eq!(durable_count(&runtime).await, 0);
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+        assert_eq!(
+            durable_count(&runtime).await,
+            2,
+            "the second event reaches the cap"
+        );
+        assert_eq!(
+            *confirmed.lock().unwrap(),
+            vec![0x20],
+            "only the latest is confirmed"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn the_source_is_not_told_a_position_whose_write_failed() {
+        let (mut runtime, confirmed, failing) =
+            cadence_runtime(&["0/10"], std::time::Duration::from_secs(1), 100_000).await;
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+
+        failing.store(true, Ordering::SeqCst);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(
+            runtime.poll_event_batch().await.is_err(),
+            "the write failure surfaces"
+        );
+        assert!(confirmed.lock().unwrap().is_empty());
+
+        // The store recovers: the position was kept, and the retry writes and confirms it.
+        failing.store(false, Ordering::SeqCst);
+        let _empty = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(durable_count(&runtime).await, 1);
+        assert_eq!(*confirmed.lock().unwrap(), vec![0x10]);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(start_paused = true)]
+    async fn force_stop_still_writes_what_was_acknowledged() {
+        let (mut runtime, confirmed, _) =
+            cadence_runtime(&["0/10"], std::time::Duration::from_secs(3600), 100_000).await;
+
+        let batch = runtime.poll_event_batch().await.unwrap();
+        runtime.commit_ack(batch.ack_mode()).await.unwrap();
+        runtime.force_stop().await.unwrap();
+        assert_eq!(durable_count(&runtime).await, 1);
+        assert_eq!(*confirmed.lock().unwrap(), vec![0x10]);
     }
 
     #[cfg(feature = "postgres")]
@@ -7068,6 +7344,17 @@ mod tests {
     /// surfacing the transient error to the caller.
     #[tokio::test]
     async fn recoverable_stream_error_triggers_reconnect_and_resumes_delivery() {
+        reconnect_resumes_from_the_acknowledged_position(false).await;
+    }
+
+    /// The same, when the first reconnect attempt fails and the next poll reconnects: the
+    /// position acknowledged before the error is still written before the stream resumes.
+    #[tokio::test]
+    async fn a_reconnect_after_a_failed_connect_resumes_from_the_acknowledged_position() {
+        reconnect_resumes_from_the_acknowledged_position(true).await;
+    }
+
+    async fn reconnect_resumes_from_the_acknowledged_position(fail_first_reconnect: bool) {
         use std::collections::VecDeque;
         use std::sync::atomic::{AtomicU32, Ordering as AOrdering};
 
@@ -7112,6 +7399,7 @@ mod tests {
         // Second stream (after reconnect): 2 events.
         struct ReconnectableSource {
             call_count: Arc<AtomicU32>,
+            connect_failures: Arc<AtomicU32>,
         }
 
         #[async_trait]
@@ -7152,12 +7440,25 @@ mod tests {
             fn source_type(&self) -> &str {
                 "mock"
             }
+
+            async fn connect(&self) -> crate::core::Result<()> {
+                let left = self.connect_failures.load(AOrdering::SeqCst);
+                if left == 0 {
+                    return Ok(());
+                }
+                self.connect_failures.store(left - 1, AOrdering::SeqCst);
+                Err(crate::core::Error::SourceError(
+                    "simulated connection refused".into(),
+                ))
+            }
         }
 
         // ── Setup ─────────────────────────────────────────────────────────
         let call_count = Arc::new(AtomicU32::new(0));
+        let connect_failures = Arc::new(AtomicU32::new(0));
         let source = ReconnectableSource {
             call_count: Arc::clone(&call_count),
+            connect_failures: Arc::clone(&connect_failures),
         };
 
         let checkpoint = InMemoryCheckpoint::default();
@@ -7172,6 +7473,9 @@ mod tests {
             initial_delay_ms: 1,
             max_delay_ms: 10,
         });
+        // Under an interval, so the acknowledged event is still only in memory when the
+        // stream fails: the reconnect must resume after it, not from the last write.
+        config.options.checkpoint_interval = std::time::Duration::from_secs(3600);
 
         let mut runtime: CdcRuntime = CdcRuntime::new(config).unwrap();
         runtime.inject_mock_source(Box::new(source));
@@ -7189,15 +7493,38 @@ mod tests {
             .unwrap();
 
         runtime.start().await.unwrap();
+        if fail_first_reconnect {
+            connect_failures.store(1, AOrdering::SeqCst);
+        }
 
         // ── First poll: delivers 1 event from the first stream ────────────
         let batch1 = runtime.poll_event_batch().await.unwrap();
         assert_eq!(batch1.len(), 1, "first batch should have 1 event");
         runtime.commit_ack(batch1.ack_mode()).await.unwrap();
 
+        assert_eq!(
+            runtime
+                .config
+                .checkpoint
+                .get_committed_count()
+                .await
+                .unwrap(),
+            0
+        );
+
         // ── Second poll: first stream raises a recoverable error,  ────────
         //    the runtime reconnects, and the second stream delivers 2 events.
         let batch2 = runtime.poll_event_batch().await.unwrap();
+        assert_eq!(
+            runtime
+                .config
+                .checkpoint
+                .get_committed_count()
+                .await
+                .unwrap(),
+            1,
+            "the reconnect wrote the acknowledged position before resuming from it"
+        );
         assert_eq!(
             batch2.len(),
             2,

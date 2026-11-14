@@ -1132,6 +1132,19 @@ fn validate_delivery_contract(config: &AppConfig) -> Result<(), ConfigError> {
         return Ok(());
     }
 
+    // The position is written inside the sink's transaction; holding it back would commit
+    // the records without it, and a crash would then replay what a `read_committed`
+    // consumer already has.
+    if let Some(interval_ms) = config.runtime.checkpoint_interval_ms
+        && interval_ms > 0
+    {
+        return Err(ConfigError::Invalid(format!(
+            "runtime.checkpoint_interval_ms={interval_ms} cannot be used with \
+             delivery_contract=\"effectively_once\": the checkpoint is written in each Kafka \
+             transaction. Remove it, or set 0"
+        )));
+    }
+
     // Every sink the events reach has to carry the guarantee, because the contract is a
     // property of the pipeline rather than of whichever sink happens to be listed first.
     //
@@ -1451,3 +1464,7 @@ mod sink_tests;
 #[cfg(test)]
 #[path = "loader_source_tests.rs"]
 mod source_tests;
+
+#[cfg(test)]
+#[path = "loader_admin_tests.rs"]
+mod admin_tests;

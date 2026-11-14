@@ -5,6 +5,78 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.23.0
+
+The checkpoint is written once a second instead of per batch, which streams about a fifth more rows
+per second; a crash replays at most that second, and loses nothing. The initial snapshot is
+measured, and three costs that bought nothing are gone.
+
+### Changed: the checkpoint is written once a second
+
+Under `at_least_once` the server wrote the checkpoint, and confirmed the position to PostgreSQL,
+after every batch: a durable write — on macOS an `F_FULLFSYNC` — in the path of every batch. Every
+comparable tool writes it on a cadence instead (Debezium every 60 s).
+
+- **`[runtime] checkpoint_interval_ms`** (1000) and **`checkpoint_max_events`** (100 000): the
+  position is written when either is reached, on shutdown, and before a reconnect resumes. `0`
+  writes per batch.
+- **What a crash costs:** the rows delivered since the last write are delivered again — at most
+  one interval. PostgreSQL is told a position only once it is written, so nothing is lost, and a
+  clean shutdown replays nothing.
+- **`effectively_once` is unchanged**: the checkpoint is part of each Kafka transaction. The
+  loader refuses a non-zero `checkpoint_interval_ms` there.
+- **Library:** `RuntimeOptions::with_checkpoint_interval` and `with_checkpoint_max_events`. The
+  default stays per batch, so `commit_ack` still returns with the position durable unless you
+  opt in.
+- **Measured** (`cargo xtask pipeline-bench`, two alternating runs each, one machine):
+  `at_least_once` 25 500–26 300 → 31 400–31 900 rows/s, p99 7.1–7.4 → 5.8–5.9 s; the snapshot to
+  Kafka 27 300–28 700 → 33 000–34 000 rows/s. CPU per row did not change: the gain is waiting on
+  the drive. Not yet measured on Linux, where `fsync` is cheaper. See
+  [Performance](site/content/docs/performance.md).
+- *Evidence*: runtime tests fail when the position is written per commit under an interval, when
+  the source is confirmed before the write, when an idle poll, `stop`, `force_stop` or either
+  reconnect path (straight after the error, or on a later poll after a failed connect) does not
+  write it, and when a failed write drops it. A PostgreSQL worker that acknowledges a
+  batch under a one-hour interval and is killed leaves nothing durable, and the restart replays the
+  batch (`runtime_postgres_process_kill_replays_a_batch_acknowledged_within_the_interval`). The
+  loader tests fail when `effectively_once` defaults to an interval or accepts one.
+
+### Added: the initial snapshot is measured
+
+`pipeline-bench` reads a 1 000 000-row table three ways and reports rows/s and rustcdc's CPU per
+row: PostgreSQL alone (`COPY`), rustcdc to a file, rustcdc to Kafka. PostgreSQL scans about
+950 000 rows/s, so a single reader is not the limit; rustcdc's work per row is.
+`PIPELINE_BENCH_SNAPSHOT_ROWS` sets the size; `--smoke` skips it.
+
+### Changed: less work per event
+
+From the snapshot's profile, CPU per row to Kafka 23.4 → 17.9 µs:
+
+- The correctness sample fingerprints in process instead of hashing with SHA-256.
+- krafka 0.32 opens its per-record producer span at `debug`, so the default `info` log layer no
+  longer builds and formats one per record: about a quarter of busy CPU.
+- An empty transform pipeline is skipped, and a sink send arms its timeout only when it has to
+  wait.
+
+### Changed: krafka 0.31.1 → 0.32.0
+
+The per-record producer span moves to `debug`, a record costs two allocations fewer, and dropping
+a producer that holds no records no longer warns. Snapshot to Kafka, CPU per row 18.3 → 17.5 µs
+(`cargo xtask pipeline-bench`, one machine).
+
+### Upgrading
+
+- **A crash of the server under `at_least_once` now replays up to one second** of delivered rows,
+  where it replayed one batch. `[runtime] checkpoint_interval_ms = 0` restores per-batch writes.
+- **`effectively_once` refuses `checkpoint_interval_ms` above 0** at load.
+- The library's default is unchanged.
+
+### Docs
+
+- [Large transactions](site/content/docs/connectors/postgres.md#large-transactions) states that
+  PostgreSQL cannot stream a transaction whose rows carry TOASTed values; it spills on the primary.
+- The [Performance](site/content/docs/performance.md) card is measured on 0.23.0.
+
 ## 0.22.0
 
 Large PostgreSQL transactions stream while they run instead of spilling on the primary; a

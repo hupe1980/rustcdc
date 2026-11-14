@@ -57,6 +57,13 @@ async fn main() -> rustcdc::Result<()> {
     if !snapshot_tables.is_empty() {
         runtime_config = runtime_config.with_snapshot_tables(snapshot_tables);
     }
+    if let Ok(interval_ms) = std::env::var("CDC_RS_WORKER_CHECKPOINT_INTERVAL_MS") {
+        let interval_ms = interval_ms.parse::<u64>().map_err(|error| {
+            rustcdc::Error::ConfigError(format!("CDC_RS_WORKER_CHECKPOINT_INTERVAL_MS: {error}"))
+        })?;
+        runtime_config =
+            runtime_config.with_checkpoint_interval(Duration::from_millis(interval_ms));
+    }
 
     let mut runtime = CdcRuntime::new(runtime_config)?;
 

@@ -188,6 +188,16 @@ impl IncrementalSnapshotConfig {
 
 impl AppConfig {
     pub const SUPPORTED_API_VERSION: &'static str = "v1";
+
+    /// `runtime.checkpoint_interval_ms` as it applies: per batch under `effectively_once`,
+    /// where the position is part of the sink's transaction.
+    pub fn checkpoint_interval_ms(&self) -> u64 {
+        match (self.runtime.checkpoint_interval_ms, self.delivery_contract) {
+            (Some(interval_ms), _) => interval_ms,
+            (None, DeliveryContract::EffectivelyOnce) => 0,
+            (None, DeliveryContract::AtLeastOnce) => DEFAULT_CHECKPOINT_INTERVAL_MS,
+        }
+    }
 }
 
 /// End-to-end delivery guarantee requested by the operator.
@@ -612,6 +622,19 @@ pub struct RuntimeTuningConfig {
     #[serde(default = "default_max_poll_wait")]
     pub max_poll_wait_ms: u64,
 
+    /// How long an acknowledged position may wait before it is written to the state
+    /// backend and confirmed to the source. A crash replays at most this much; nothing is
+    /// lost. `0` writes per batch.
+    ///
+    /// Omit for the default: 1000 under `at_least_once`, per batch under
+    /// `effectively_once`, where the position is written in the sink's transaction.
+    #[serde(default)]
+    pub checkpoint_interval_ms: Option<u64>,
+
+    /// Acknowledged events after which the position is written, whatever the interval.
+    #[serde(default = "default_runtime_checkpoint_max_events")]
+    pub checkpoint_max_events: u64,
+
     /// Explicit stall threshold for the runtime health verdict, in milliseconds.
     ///
     /// Omit to derive it from the poll budget (`max_poll_wait_ms × 6`, floor 30 s). The
@@ -832,6 +855,8 @@ impl Default for RuntimeTuningConfig {
             max_buffer_size: default_max_buffer(),
             max_poll_wait_ms: default_max_poll_wait(),
             health_stall_threshold_ms: None,
+            checkpoint_interval_ms: None,
+            checkpoint_max_events: default_runtime_checkpoint_max_events(),
             max_event_bytes: default_runtime_max_event_bytes(),
             sink_flush_interval_events: default_runtime_sink_flush_interval_events(),
             sink_delivery_queue_capacity: default_runtime_sink_delivery_queue_capacity(),
@@ -892,6 +917,10 @@ impl RuntimeTuningConfig {
                     self.max_poll_wait_ms
                 ));
             }
+        }
+
+        if self.checkpoint_max_events == 0 {
+            return Err("runtime.checkpoint_max_events must be > 0".to_string());
         }
 
         if self.max_event_bytes == 0 {
@@ -1030,6 +1059,13 @@ fn default_max_buffer() -> usize {
 
 fn default_max_poll_wait() -> u64 {
     100
+}
+
+/// The interval under `at_least_once` when none is set.
+pub const DEFAULT_CHECKPOINT_INTERVAL_MS: u64 = 1_000;
+
+fn default_runtime_checkpoint_max_events() -> u64 {
+    rustcdc::core::DEFAULT_CHECKPOINT_MAX_EVENTS
 }
 
 fn default_runtime_max_event_bytes() -> usize {

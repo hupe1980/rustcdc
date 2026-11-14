@@ -33,7 +33,15 @@ use process_crash_worker::resolve_crash_worker_bin;
 
 #[tokio::test]
 async fn runtime_postgres_process_kill_replays_uncommitted_batch() -> rustcdc::Result<()> {
-    run_postgres_process_kill_replay_scenario(false).await
+    run_postgres_process_kill_replay_scenario(false, false).await
+}
+
+/// Acknowledged under a checkpoint interval, then killed before the interval ran out: the
+/// position was never written or confirmed, so the restart replays the batch and loses none.
+#[tokio::test]
+async fn runtime_postgres_process_kill_replays_a_batch_acknowledged_within_the_interval()
+-> rustcdc::Result<()> {
+    run_postgres_process_kill_replay_scenario(false, true).await
 }
 
 #[tokio::test]
@@ -136,6 +144,7 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch()
         Some("public.runtime_crash_snapshot_users"),
         true,
         false,
+        None,
     )?;
 
     wait_for_marker(&marker_file, Duration::from_secs(90))?;
@@ -247,11 +256,12 @@ async fn runtime_postgres_process_kill_resumes_snapshot_after_committed_batch()
 #[tokio::test]
 async fn runtime_postgres_process_kill_replays_uncommitted_batch_with_encryption_transform()
 -> rustcdc::Result<()> {
-    run_postgres_process_kill_replay_scenario(true).await
+    run_postgres_process_kill_replay_scenario(true, false).await
 }
 
 async fn run_postgres_process_kill_replay_scenario(
     _enable_encryption_transform: bool,
+    acknowledged_within_interval: bool,
 ) -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!(
@@ -363,8 +373,9 @@ async fn run_postgres_process_kill_replay_scenario(
         "rustcdc_runtime_crash_slot",
         "rustcdc_runtime_crash_pub",
         None,
+        acknowledged_within_interval,
         false,
-        false,
+        acknowledged_within_interval.then_some(3_600_000),
     )?;
 
     wait_for_marker(&marker_file, Duration::from_secs(90))?;
@@ -377,9 +388,16 @@ async fn run_postgres_process_kill_replay_scenario(
     // slot the server still considers active fails with SQLSTATE 55006.
     wait_for_slot_released(&admin_client, "rustcdc_runtime_crash_slot").await?;
 
-    // Read-only, for the same reason as above.
+    // Read-only, for the same reason as above. Nothing is durable — under an interval,
+    // not even what the worker acknowledged.
     let reader_before = FileCheckpoint::read_only(checkpoint_dir.path());
     assert_eq!(reader_before.get_committed_count().await?, 0);
+    if acknowledged_within_interval {
+        assert!(
+            read_worker_marker(&marker_file)?.acked,
+            "the worker acknowledged its batch"
+        );
+    }
 
     let source_cfg = PostgresSourceConfig {
         host: host.to_string(),
@@ -592,6 +610,7 @@ async fn runtime_postgres_process_kill_mid_stream_loses_no_committed_row() -> ru
         None,
         false,
         true,
+        None,
     )?;
     wait_for_marker(&marker_file, Duration::from_secs(90))?;
     worker.kill().map_err(rustcdc::Error::IoError)?;
@@ -710,6 +729,7 @@ fn spawn_crash_worker(
     snapshot_table: Option<&str>,
     ack_first_batch: bool,
     until_streaming: bool,
+    checkpoint_interval_ms: Option<u64>,
 ) -> rustcdc::Result<Child> {
     let worker_bin = resolve_worker_bin()?;
 
@@ -734,6 +754,12 @@ fn spawn_crash_worker(
         );
     if let Some(table) = snapshot_table {
         command.env("CDC_RS_WORKER_SNAPSHOT_TABLES", table);
+    }
+    if let Some(interval_ms) = checkpoint_interval_ms {
+        command.env(
+            "CDC_RS_WORKER_CHECKPOINT_INTERVAL_MS",
+            interval_ms.to_string(),
+        );
     }
     command.spawn().map_err(rustcdc::Error::IoError)
 }
