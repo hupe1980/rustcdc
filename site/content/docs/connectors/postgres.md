@@ -193,8 +193,10 @@ size, not their larger size in memory). A transaction that outgrows it is handle
 pipeline commits:
 
 - **at-least-once, batches may split transactions** (the default): its events are released
-  as they come, with `total_events: null` (`0` in Avro and Protobuf); only its last event,
-  held until the COMMIT message, carries the total. Every event released before the COMMIT
+  as they come, with `total_events: null` (`0` in Avro and Protobuf), all but the newest. The
+  events still held at the COMMIT message carry the total, and the transaction's last event is
+  always among them. The newest event is held even when it alone is larger than the limit, so
+  one row bounds the memory, not the limit. Every event released before the COMMIT
   message resumes from where the stream stood at the transaction's BEGIN, so a crash part-way
   replays the whole transaction: duplicates, never a gap.
 - **`delivery_contract = "effectively_once"`, or `transaction_boundary =

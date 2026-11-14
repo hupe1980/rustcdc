@@ -52,7 +52,7 @@ change history.
 | `table` | string | yes | Source table name |
 | `primary_key` | string[] \| null | no | Primary-key column names, when available |
 | `snapshot` | object \| null | no | Snapshot metadata present only during an initial table scan |
-| `transaction` | object \| null | no | Transaction metadata (`tx_id`, `total_events`, `event_index`) when the event belongs to a transaction. `total_events` is `null` when the source released the event before it knew the size, as PostgreSQL does for a transaction larger than `transaction_buffer_bytes`; the transaction's last event always carries it |
+| `transaction` | object \| null | no | Transaction metadata (`tx_id`, `total_events`, `event_index`) when the event belongs to a transaction. `total_events` is `null` when the source released the event before it knew the size, as PostgreSQL does for a transaction larger than `transaction_buffer_bytes`; the events released at the commit, the transaction's last always among them, carry it |
 | `envelope_version` | u16 | yes | Canonical envelope version for compatibility checks |
 | `before_is_key_only` | bool | yes | `true` when `before` holds only primary-key columns (PostgreSQL `REPLICA IDENTITY DEFAULT`) — `before` is then not a complete row snapshot |
 | `unavailable_columns` | string[] | omitted when empty | Columns that exist on the table but are **absent** from `after` because the source could not supply them (PostgreSQL unchanged-TOAST). Absent ≠ `NULL` — see below |
