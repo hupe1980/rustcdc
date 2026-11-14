@@ -152,7 +152,10 @@ impl OwnedStateDir {
     fn renew_if_due(&self) -> Result<(), AppError> {
         let mut state = self.state();
         let now_ms = remote_lease::now_unix_ms();
+        // A stopped owner goes through `renew_locked`, which refuses: skipping it inside
+        // the heartbeat window would let a fenced owner write.
         if !state.released
+            && !state.fenced
             && now_ms.saturating_sub(state.last_renewed_ms) < LEASE_HEARTBEAT.as_millis() as u64
         {
             return Ok(());
@@ -900,6 +903,37 @@ mod lease_tests {
         lease.renewed_at_ms = stale;
         write_lease(&owner.path, &lease).expect("the successor's lease expires");
         owner.renew().expect_err("a fenced owner must stay fenced");
+    }
+
+    /// A checkpoint write refuses once the timer has fenced the owner, even inside the
+    /// heartbeat window in which a write skips the lease check.
+    ///
+    /// The paused clock keeps the wall-clock age of the last renewal inside that window,
+    /// as a backward clock step would in production.
+    #[tokio::test(start_paused = true)]
+    async fn a_checkpoint_write_refuses_once_the_timer_has_fenced_the_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut checkpoint, _age, owner) = build_checkpoint(dir.path()).await.expect("build");
+
+        write_lease(
+            &owner.path,
+            &LeaseRecord {
+                owner: "successor:2:feedface".to_string(),
+                renewed_at_ms: remote_lease::now_unix_ms(),
+                epoch: owner.epoch + 1,
+                boot_id: None,
+                lock_dev: None,
+            },
+        )
+        .expect("successor takes the lease");
+        tokio::time::sleep(LEASE_HEARTBEAT + std::time::Duration::from_secs(1)).await;
+        assert!(owner.state().fenced, "the timer must have fenced the owner");
+        owner.state().last_renewed_ms = remote_lease::now_unix_ms();
+
+        checkpoint
+            .save(&PostgresOffset::new(100, "slot"), 1)
+            .await
+            .expect_err("a fenced owner must not write a checkpoint");
     }
 
     /// A lease from another host is judged by the TTL alone.
