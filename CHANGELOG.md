@@ -5,6 +5,35 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.23.1
+
+A crash part-way through a PostgreSQL transaction larger than one batch lost the rest of it. Every
+release since 0.15.0 is affected, under default settings; upgrade.
+
+### Fixed: a crash inside a large PostgreSQL transaction loses no rows (#43)
+
+Every event of a transaction resumed from the transaction's end, so once its first batch was
+acknowledged, the checkpoint and the slot's `confirmed_flush_lsn` were past rows still in memory.
+A crash before they were delivered skipped them: 76 000 of 80 000 rows in the report.
+
+- Only a transaction's last event resumes from its end. Every earlier one resumes from where the
+  stream stood at its BEGIN, so a crash part-way through replays the whole transaction.
+- Without a checkpoint that position is the slot's `confirmed_flush_lsn`, not the WAL head, so a
+  transaction the slot already held is replayed too.
+- The incremental-snapshot driver forwards the position, so the same events checkpoint the same
+  way with and without `[incremental_snapshot]`.
+- *Limit:* past the last 100 000 unconfirmed transactions an event falls back to its own change
+  position.
+- *What it costs:* a crash inside such a transaction now replays the part already delivered.
+  Under `effectively_once` those rows arrive twice; [Concepts](site/content/docs/concepts.md#effectively-once)
+  states it.
+- *Evidence*: a crash worker acknowledges the first 256-event batch of a 3 000-row transaction
+  and is killed; the restart delivers every row, with and without a checkpoint
+  (`runtime_postgres_process_kill_after_the_first_batch_of_a_large_transaction_loses_no_row`,
+  `…_of_a_backlogged_transaction_without_a_checkpoint_loses_no_row`). Before the fix none of the
+  3 000 arrived. Unit and container tests pin the resume position for both transports, after a
+  standalone message, and for a schema event. Thanks to @vu2jpr (#44).
+
 ## 0.23.0
 
 The checkpoint is written once a second instead of per batch, which streams about a fifth more rows

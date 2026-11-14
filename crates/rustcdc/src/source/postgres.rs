@@ -1343,8 +1343,8 @@ impl StreamHandle for PostgresStreamHandle {
         // checkpoints and confirms the slot after each. Only its **last** event may resume
         // from its end — `StreamHandle::resume_offset_for` explains why that position is the
         // one that skips it. An earlier event resuming from there would move both past rows
-        // still in memory, and a crash before they were delivered would lose them for good
-        // (#43). Every other event resumes from `resume_floor` as it stood at the BEGIN: the
+        // still in memory, and a crash before they were delivered would lose them for good.
+        // Every other event resumes from `resume_floor` as it stood at the BEGIN: the
         // highest position already checkpointable, and before the commit record, so a restart
         // replays the whole transaction.
         //
@@ -2007,8 +2007,8 @@ mod tests {
     /// The runtime checkpoints after every delivered batch, and a transaction larger than
     /// one batch is delivered in several. If an earlier event of it resumed from the
     /// transaction's end, the first batch's commit would confirm the slot past rows still
-    /// in memory, and a crash before the rest were delivered would lose them for good
-    /// (#43). Every other event resumes from the last committed end read before its
+    /// in memory, and a crash before the rest were delivered would lose them for good.
+    /// Every other event resumes from the last committed end read before its
     /// BEGIN: never behind an earlier checkpoint, and inside the transaction's range, so a
     /// restart replays all of it.
     #[tokio::test]
