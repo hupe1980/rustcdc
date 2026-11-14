@@ -2,7 +2,13 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::{metrics::SdkMeterProvider, trace::SdkTracerProvider};
 use std::time::Duration;
-use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    Layer as _,
+    filter::{EnvFilter, FilterFn, filter_fn},
+    fmt,
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::error::AppError;
 
@@ -124,6 +130,15 @@ impl OtlpProtocol {
     }
 }
 
+/// What the log layer takes: everything but krafka's spans.
+///
+/// krafka opens an OpenTelemetry span per produced record. They are for a tracer, and a log
+/// layer that accepted them formatted a dozen fields for every record — a quarter of a snapshot's
+/// CPU. Filtered here, a span nobody else wants costs krafka a callsite check.
+fn log_layer_filter() -> FilterFn {
+    filter_fn(|metadata| !(metadata.is_span() && metadata.target().starts_with("krafka")))
+}
+
 /// Initialise the global tracing subscriber and, optionally, the OTel tracer and metrics
 /// providers.
 ///
@@ -157,7 +172,8 @@ pub fn init_with_metrics(
                     fmt::layer()
                         .json()
                         .with_current_span(true)
-                        .with_span_list(true),
+                        .with_span_list(true)
+                        .with_filter(log_layer_filter()),
                 )
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .try_init()
@@ -170,7 +186,8 @@ pub fn init_with_metrics(
                     fmt::layer()
                         .json()
                         .with_current_span(true)
-                        .with_span_list(true),
+                        .with_span_list(true)
+                        .with_filter(log_layer_filter()),
                 )
                 .try_init()
                 .map_err(|e| AppError::Other(e.to_string()))?;
@@ -178,7 +195,11 @@ pub fn init_with_metrics(
         (_, Some(tracer)) => {
             tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt::layer().with_target(true))
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_filter(log_layer_filter()),
+                )
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .try_init()
                 .map_err(|e| AppError::Other(e.to_string()))?;
@@ -186,7 +207,11 @@ pub fn init_with_metrics(
         _ => {
             tracing_subscriber::registry()
                 .with(filter)
-                .with(fmt::layer().with_target(true))
+                .with(
+                    fmt::layer()
+                        .with_target(true)
+                        .with_filter(log_layer_filter()),
+                )
                 .try_init()
                 .map_err(|e| AppError::Other(e.to_string()))?;
         }
@@ -400,6 +425,27 @@ fn validate_otlp_endpoint(endpoint: &str, allow_insecure: bool) -> Result<(), Ap
 
 #[cfg(test)]
 mod tests {
+    /// A krafka record span reaches no layer when only the log layer is installed, so it is never
+    /// built; a krafka event and a span of our own still are.
+    #[test]
+    fn the_log_layer_takes_no_krafka_spans() {
+        use tracing_subscriber::{Layer as _, fmt, layer::SubscriberExt};
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(std::io::sink)
+                .with_filter(super::log_layer_filter()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let record = tracing::info_span!(target: "krafka::producer", "send");
+            assert!(
+                record.is_disabled(),
+                "a per-record span must not be built for the log"
+            );
+            let ours = tracing::info_span!(target: "rustcdc_server::runtime", "batch");
+            assert!(!ours.is_disabled());
+        });
+    }
+
     use super::{
         OtlpProtocol, build_optional_tracer, http_signal_endpoint, validate_otlp_endpoint,
     };
