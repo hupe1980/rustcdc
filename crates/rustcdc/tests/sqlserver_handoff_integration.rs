@@ -78,7 +78,7 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> rustcdc::Result<()> {
         30,
     ));
 
-    sqlserver_testkit::retry_refused("connect", || source.connect()).await?;
+    source.connect().await?;
     let mut snapshot = source.start_snapshot(&["dbo.orders"]).await?;
 
     // Drain snapshot before handoff.
@@ -124,7 +124,7 @@ async fn sqlserver_handoff_snapshot_to_stream_no_gap() -> rustcdc::Result<()> {
         "rustcdc_handoff".into(),
         30,
     ));
-    sqlserver_testkit::retry_refused("connect", || resumed.connect()).await?;
+    resumed.connect().await?;
     let mut resumed_stream = resumed.start_stream(Some(resume.as_ref())).await?;
 
     sqlserver_testkit::sql_exec(

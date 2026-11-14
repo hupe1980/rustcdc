@@ -3,7 +3,9 @@
 use rustcdc::{SqlServerSourceConfig, TransportConfig};
 use std::time::Duration;
 use testcontainers::{
-    ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort, runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
+    core::{IntoContainerPort, WaitFor},
+    runners::AsyncRunner,
 };
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -71,11 +73,16 @@ pub fn tested_tags() -> Vec<&'static str> {
 pub async fn start_sqlserver_container(
     image_tag: &str,
 ) -> rustcdc::Result<ContainerAsync<GenericImage>> {
+    // SQL Server listens before its startup is over; a suite that connects in that window can
+    // be refused for longer than its retries allow on a loaded runner. "Recovery is complete" is
+    // the last line of its startup on every tested release.
     match GenericImage::new("mcr.microsoft.com/mssql/server", image_tag)
         .with_exposed_port(1433.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Recovery is complete"))
         .with_env_var("ACCEPT_EULA", "Y")
         .with_env_var("MSSQL_SA_PASSWORD", SQLSERVER_SA_PASSWORD)
         .with_env_var("MSSQL_PID", "Developer")
+        .with_startup_timeout(Duration::from_secs(240))
         .start()
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))
@@ -182,55 +189,6 @@ pub async fn connect_admin_with_retry(
     }))
 }
 
-/// Run `op` again while the server refuses or resets the connection; return anything else at once.
-///
-/// A SQL Server container on a shared runner can refuse a *new* connection while earlier ones
-/// still work, so a suite fails on the connector's first connect with nothing wrong in the
-/// connector. A wrong password or a TLS error is never retried. The connector reports its I/O
-/// errors as text, so the refusal is recognised by its text: this is a test harness, not a
-/// classifier anything ships.
-#[allow(dead_code)]
-pub async fn retry_refused<T, Fut>(label: &str, op: impl FnMut() -> Fut) -> rustcdc::Result<T>
-where
-    Fut: std::future::Future<Output = rustcdc::Result<T>>,
-{
-    retry_refused_with(label, 30, Duration::from_secs(1), op).await
-}
-
-async fn retry_refused_with<T, Fut>(
-    label: &str,
-    attempts: u32,
-    delay: Duration,
-    mut op: impl FnMut() -> Fut,
-) -> rustcdc::Result<T>
-where
-    Fut: std::future::Future<Output = rustcdc::Result<T>>,
-{
-    let mut attempt = 1;
-    loop {
-        match op().await {
-            Err(error) if attempt < attempts && is_refused(&error) => {
-                eprintln!("{label}: refused (attempt {attempt}/{attempts}), retrying: {error}");
-                attempt += 1;
-                sleep(delay).await;
-            }
-            result => return result,
-        }
-    }
-}
-
-fn is_refused(error: &rustcdc::Error) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    [
-        "connection refused",
-        "connection reset",
-        "os error 111",
-        "os error 104",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
-}
-
 #[allow(dead_code)]
 pub async fn enable_cdc(host: &str, port: u16, database: &str) -> rustcdc::Result<()> {
     let mut client = connect_admin_with_retry(host, port, 60, Duration::from_millis(500)).await?;
@@ -301,54 +259,4 @@ pub async fn sql_exec_with_retry(client: &mut SqlClient, sql: &str) -> rustcdc::
     Err(rustcdc::Error::StateError(
         "sql_exec_with_retry exhausted attempts unexpectedly".to_string(),
     ))
-}
-
-#[cfg(test)]
-mod retry_refused_tests {
-    use super::retry_refused_with;
-    use std::{cell::Cell, time::Duration};
-
-    fn refused() -> rustcdc::Error {
-        rustcdc::Error::SourceError("Connection refused (os error 111)".into())
-    }
-
-    #[tokio::test]
-    async fn a_refusal_is_retried_until_the_server_accepts() {
-        let calls = Cell::new(0);
-        let result = retry_refused_with("test", 5, Duration::ZERO, || {
-            calls.set(calls.get() + 1);
-            let call = calls.get();
-            async move { if call < 3 { Err(refused()) } else { Ok(call) } }
-        })
-        .await;
-        assert_eq!(result.unwrap(), 3);
-    }
-
-    #[tokio::test]
-    async fn any_other_error_is_returned_on_the_first_attempt() {
-        let calls = Cell::new(0);
-        let result: rustcdc::Result<()> = retry_refused_with("test", 5, Duration::ZERO, || {
-            calls.set(calls.get() + 1);
-            async {
-                Err(rustcdc::Error::SourceError(
-                    "Login failed for user 'sa'".into(),
-                ))
-            }
-        })
-        .await;
-        assert!(result.is_err());
-        assert_eq!(calls.get(), 1, "a login error must not be retried");
-    }
-
-    #[tokio::test]
-    async fn a_refusal_that_never_ends_is_returned_after_the_bound() {
-        let calls = Cell::new(0);
-        let result: rustcdc::Result<()> = retry_refused_with("test", 4, Duration::ZERO, || {
-            calls.set(calls.get() + 1);
-            async { Err(refused()) }
-        })
-        .await;
-        assert!(result.unwrap_err().to_string().contains("refused"));
-        assert_eq!(calls.get(), 4);
-    }
 }

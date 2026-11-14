@@ -147,7 +147,7 @@ async fn sqlserver_snapshot_chunking_matches_table_count() -> rustcdc::Result<()
         30,
     ));
 
-    sqlserver_testkit::retry_refused("connect", || source.connect()).await?;
+    source.connect().await?;
     let mut snapshot = source.start_snapshot(&["dbo.users"]).await?;
 
     let mut read_count = 0_u64;
@@ -286,7 +286,7 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         30,
     ));
 
-    sqlserver_testkit::retry_refused("connect", || source.connect()).await?;
+    source.connect().await?;
     let mut snapshot = source.start_snapshot(&["dbo.users"]).await?;
 
     let mut checkpoint = InMemoryCheckpoint::default();
@@ -336,7 +336,7 @@ async fn sqlserver_snapshot_resume_has_no_duplicates_and_matches_select_content(
         database.into(),
         30,
     ));
-    sqlserver_testkit::retry_refused("connect", || resumed_source.connect()).await?;
+    resumed_source.connect().await?;
 
     let mut resumed_snapshot = resumed_source
         .start_snapshot_from_checkpoint(&["dbo.users"], Some(resume_offset.as_ref()))
@@ -463,7 +463,7 @@ async fn sqlserver_incremental_snapshot_rows_carry_the_shape() -> rustcdc::Resul
         database.into(),
         30,
     ));
-    sqlserver_testkit::retry_refused("connect", || source.connect()).await?;
+    source.connect().await?;
     let mut handle = source
         .start_incremental_snapshot(
             rustcdc::IncrementalSnapshotConfig::new(vec!["dbo.shaped".to_string()])

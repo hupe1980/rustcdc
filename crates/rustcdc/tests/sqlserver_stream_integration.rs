@@ -147,7 +147,7 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
     let config = sqlserver_testkit::source_config(host.clone(), port, "rustcdc_test".into(), 30);
 
     let mut source = SqlServerConnection::new(config.clone());
-    sqlserver_testkit::retry_refused("connect", || source.connect()).await?;
+    source.connect().await?;
     let mut stream = source.start_stream(None).await?;
 
     // initial change batch
@@ -232,7 +232,7 @@ async fn run_sqlserver_stream_insert_update_delete_and_resume() -> rustcdc::Resu
 
     // restart from checkpoint
     let mut resumed_source = SqlServerConnection::new(config);
-    sqlserver_testkit::retry_refused("connect", || resumed_source.connect()).await?;
+    resumed_source.connect().await?;
     let mut resumed_stream = resumed_source.start_stream(Some(resume.as_ref())).await?;
 
     sql_exec(
@@ -348,7 +348,7 @@ async fn run_sqlserver_stream_emits_schema_change_for_capture_metadata_refresh()
         sqlserver_testkit::source_config(host.clone(), port, "rustcdc_schema_change".into(), 30);
 
     let mut source = SqlServerConnection::new(config);
-    sqlserver_testkit::retry_refused("connect", || source.connect()).await?;
+    source.connect().await?;
     let mut stream = source.start_stream(None).await?;
 
     // Trigger capture metadata drift by changing source table and recreating capture instance.
@@ -503,7 +503,7 @@ async fn run_sqlserver_capture_instance_switch() -> rustcdc::Result<()> {
         db.into(),
         30,
     ));
-    sqlserver_testkit::retry_refused("connect", || source.connect()).await?;
+    source.connect().await?;
     let mut stream = source.start_stream(None).await?;
     let mut events = Vec::new();
 

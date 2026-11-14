@@ -134,7 +134,7 @@ async fn sqlserver_decodes_non_trivial_types_without_loss() -> rustcdc::Result<(
 
     let config = sqlserver_testkit::source_config(host.clone(), port, database.to_string(), 30);
     let mut connection = SqlServerConnection::new(config);
-    sqlserver_testkit::retry_refused("connect", || connection.connect()).await?;
+    connection.connect().await?;
     let mut stream = connection.start_stream(None).await?;
 
     sqlserver_testkit::sql_exec_with_retry(
@@ -357,7 +357,7 @@ async fn sqlserver_null_is_distinguishable_from_an_undecodable_value() -> rustcd
 
     let config = sqlserver_testkit::source_config(host.clone(), port, database.to_string(), 30);
     let mut connection = SqlServerConnection::new(config);
-    sqlserver_testkit::retry_refused("connect", || connection.connect()).await?;
+    connection.connect().await?;
     let mut stream = connection.start_stream(None).await?;
 
     sqlserver_testkit::sql_exec_with_retry(

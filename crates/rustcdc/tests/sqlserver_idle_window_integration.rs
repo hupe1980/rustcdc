@@ -110,7 +110,7 @@ async fn a_change_after_a_long_idle_period_is_still_captured() -> rustcdc::Resul
         DATABASE.to_string(),
         30,
     ));
-    sqlserver_testkit::retry_refused("connect", || source.connect()).await?;
+    source.connect().await?;
     let mut stream = source.start_stream(None).await?;
 
     // ── Idle: advance the window repeatedly against a standing harvested maximum ──

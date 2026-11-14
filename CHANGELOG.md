@@ -20,12 +20,13 @@ what breaks and what to do about it.
   The release's verify step runs the same script.
 - **CI:** only `main` writes caches, so a pull request's no longer evict the ones every run reads;
   the release evidence runs on main only, where the release reads it; the fuzz job is cached.
-- **SQL Server suites** retry the connector's connect while the server refuses connections, never
-  on any other error.
+- **SQL Server suites** start once SQL Server has finished starting ("Recovery is complete"), not
+  when it first listens: a suite that connected in between was refused for longer than its retries
+  on a loaded runner.
 - *Evidence*: a fresh worktree without the console built the server twice, recompiling it each
   time, and now builds nothing the second time; with the `ui/dist` half reverted it recompiles
-  again. A test file planted over its line budget fails `cargo xtask gate` at `server`. The retry's
-  three tests fail with it retrying everything, and with it retrying nothing. `release-ready` was
+  again. A test file planted over its line budget fails `cargo xtask gate` at `server`. With the wait
+  pointed at a line SQL Server never logs, a suite fails at startup instead of running. `release-ready` was
   run against a released, a passed, a failed and an unmerged commit, and with GitHub refusing and
   unreachable.
 
