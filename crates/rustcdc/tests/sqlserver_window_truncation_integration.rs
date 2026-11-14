@@ -140,7 +140,7 @@ async fn run() -> rustcdc::Result<()> {
     config.max_events_per_poll = MAX_EVENTS_PER_POLL;
 
     let mut source = SqlServerConnection::new(config);
-    source.connect().await?;
+    sqlserver_testkit::retry_refused("connect", || source.connect()).await?;
     let mut stream = source.start_stream(None).await?;
 
     // Everything below is written before the first poll, so it all falls inside one LSN
