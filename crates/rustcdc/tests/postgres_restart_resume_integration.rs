@@ -186,3 +186,212 @@ async fn sql_peek_restart_delivers_nothing_new() -> rustcdc::Result<()> {
     );
     Ok(())
 }
+
+/// What a resume position must satisfy for the events of a large transaction.
+enum Lead {
+    /// The slot already holds a committed transaction when the stream starts with no
+    /// checkpoint: the stream begins at the slot's `confirmed_flush_lsn`, not at the WAL head.
+    Backlog,
+    /// A standalone logical message is delivered and confirmed first, at its own position.
+    Message,
+}
+
+/// Start with no checkpoint, deliver one 3,000-row transaction, and return the resume
+/// positions of its first and last events and the floor the first must not fall below.
+async fn first_and_last_resume(
+    transport: WalTransport,
+    slot: &str,
+    lead: Lead,
+) -> rustcdc::Result<(u64, u64, u64)> {
+    let error = |e: &dyn std::fmt::Display| rustcdc::Error::SourceError(e.to_string());
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_replication_slots=8",
+            "-c",
+            "max_wal_senders=8",
+        ])
+        .start()
+        .await
+        .map_err(|e| error(&e))?;
+    let host = container.get_host().await.map_err(|e| error(&e))?;
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|e| error(&e))?;
+    let (admin, conn) = tokio_postgres::connect(
+        &format!(
+            "host={host} port={port} user=postgres password=postgres dbname=cdc connect_timeout=30"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .map_err(|e| error(&e))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    admin
+        .batch_execute(
+            "CREATE TABLE public.t (id BIGINT PRIMARY KEY, data TEXT);
+             CREATE PUBLICATION p FOR TABLE public.t;",
+        )
+        .await
+        .map_err(|e| error(&e))?;
+
+    let cfg = PostgresSourceConfig {
+        host: host.to_string(),
+        port,
+        user: "postgres".into(),
+        password: "postgres".to_string().into(),
+        database: "cdc".into(),
+        replication_slot_name: slot.to_string(),
+        publication_name: "p".into(),
+        create_replication_slot_if_missing: true,
+        conn_timeout_secs: 30,
+        stream_poll_interval_ms: 50,
+        max_events_per_poll: 1_000,
+        capture_logical_messages: true,
+        wal_transport: transport,
+        transport: rustcdc::TransportConfig::plaintext(),
+        ..PostgresSourceConfig::default()
+    };
+    let lsn = |text: &str| -> u64 {
+        let (high, low) = text.split_once('/').expect("an LSN");
+        (u64::from_str_radix(high, 16).expect("hex") << 32)
+            | u64::from_str_radix(low, 16).expect("hex")
+    };
+    let insert = "INSERT INTO public.t SELECT n, 'row' FROM generate_series(1, 3000) n";
+
+    let mut connection = PostgresConnection::new(cfg);
+    connection.connect().await?;
+    let slot_start: String = admin
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .map_err(|e| error(&e))?
+        .get(0);
+    let mut floor = lsn(&slot_start);
+
+    if matches!(lead, Lead::Backlog) {
+        admin.batch_execute(insert).await.map_err(|e| error(&e))?;
+    }
+    let mut stream = connection.start_stream(None).await?;
+    if matches!(lead, Lead::Message) {
+        admin
+            .batch_execute("SELECT pg_logical_emit_message(false, 'probe', 'standalone')")
+            .await
+            .map_err(|e| error(&e))?;
+        let mut message = None;
+        for _ in 0..60 {
+            message = stream
+                .next_events(250)
+                .await?
+                .into_iter()
+                .find(|event| event.op == rustcdc::Operation::Message);
+            if message.is_some() {
+                break;
+            }
+        }
+        let message = message.expect("the standalone message arrives");
+        // A standalone event checkpoints at its own position: the floor from here on.
+        floor = lsn(&message.source.offset);
+        stream.confirm_lsn(floor).await?;
+        admin.batch_execute(insert).await.map_err(|e| error(&e))?;
+    }
+
+    let mut rows = Vec::new();
+    for _ in 0..80 {
+        rows.extend(
+            stream
+                .next_events(250)
+                .await?
+                .into_iter()
+                .filter(|event| event.op == rustcdc::Operation::Insert),
+        );
+        if rows.len() >= 3000 {
+            break;
+        }
+    }
+    assert_eq!(rows.len(), 3000, "the transaction is delivered whole");
+    let first = lsn(&stream
+        .resume_offset_for(&rows[0])
+        .expect("a stream event resumes"));
+    let last = lsn(&stream
+        .resume_offset_for(&rows[2999])
+        .expect("a stream event resumes"));
+    Ok((first, last, floor))
+}
+
+fn assert_first_event_resumes_inside(first: u64, last: u64, floor: u64) {
+    assert!(
+        first < last,
+        "the transaction's first event resumes at {first:#x}, at or past its end {last:#x}: \
+         a checkpoint there skips the rows not yet delivered"
+    );
+    assert!(
+        first >= floor,
+        "the first event resumes at {first:#x}, behind the position {floor:#x} the stream \
+         already stood at: the checkpoint would move backwards"
+    );
+}
+
+/// No checkpoint, and the slot already holds a committed transaction: the stream starts at
+/// the slot, so that is where the transaction's earlier events resume — not the WAL head,
+/// which is past the transaction's commit record.
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_replication_unseeded_start_resumes_a_backlogged_transaction_inside_it()
+-> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let (first, last, floor) = first_and_last_resume(
+        WalTransport::StreamingReplication,
+        "unseeded_stream",
+        Lead::Backlog,
+    )
+    .await?;
+    assert_first_event_resumes_inside(first, last, floor);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_peek_unseeded_start_resumes_a_backlogged_transaction_inside_it() -> rustcdc::Result<()>
+{
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let (first, last, floor) =
+        first_and_last_resume(WalTransport::SqlPeek, "unseeded_peek", Lead::Backlog).await?;
+    assert_first_event_resumes_inside(first, last, floor);
+    Ok(())
+}
+
+/// A standalone message checkpoints at its own position; a transaction after it must not
+/// resume from before that, or the checkpoint moves backwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_after_a_standalone_message_does_not_resume_behind_it() -> rustcdc::Result<()>
+{
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let (first, last, floor) = first_and_last_resume(
+        WalTransport::StreamingReplication,
+        "after_message",
+        Lead::Message,
+    )
+    .await?;
+    assert_first_event_resumes_inside(first, last, floor);
+    Ok(())
+}

@@ -637,8 +637,22 @@ pub trait StreamHandle: Send + Sync {
     ///
     /// Nudging the LSN forward does not help: the commit record is still ahead of `X + 1`.
     /// The only position that skips the transaction is the one **after** its commit record,
-    /// which pgoutput reports in the COMMIT message as `end_lsn`. That is what the
-    /// PostgreSQL handle returns here.
+    /// which pgoutput reports in the COMMIT message as `end_lsn`.
+    ///
+    /// That position may be returned only for a transaction's **last** event. A transaction
+    /// is delivered in as many batches as it takes, and the runtime checkpoints after each;
+    /// answering `end_lsn` for an earlier event moves the checkpoint and the slot past rows
+    /// not yet delivered, which a crash then loses. The PostgreSQL handle returns `end_lsn`
+    /// for the last event and, for every other, the highest position the stream had reached
+    /// at the transaction's BEGIN (its start, a committed end, or a standalone event's own
+    /// offset) — so a restart part-way through replays the whole transaction. A handle that
+    /// wraps another stream must forward this.
+    ///
+    /// *Limit:* the PostgreSQL handle remembers the boundaries of the last 100,000
+    /// transactions not yet confirmed. Past that it returns `None` for an evicted transaction's
+    /// events, its last included, and the runtime falls back to each event's own position: the
+    /// transaction replays on restart rather than resuming after its commit record, and that
+    /// position can sit behind an earlier checkpoint.
     ///
     /// The runtime uses this for both the durable checkpoint and the source-side
     /// confirmation, so a connector implementing it fixes replication-slot retention and

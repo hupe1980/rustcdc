@@ -675,6 +675,188 @@ async fn runtime_postgres_process_kill_mid_stream_loses_no_committed_row() -> ru
     Ok(())
 }
 
+/// A crash after the first batch of a transaction larger than one batch loses none of it.
+///
+/// The worker acknowledges its first batch, 256 events of a 3,000-row transaction, and is
+/// killed. That acknowledgement checkpoints and confirms the slot, so the position it
+/// writes decides what a restart can still read: at the transaction's end, the remaining
+/// 2,744 rows are gone for good (#43); before its BEGIN, PostgreSQL resends all of it.
+#[tokio::test]
+async fn runtime_postgres_process_kill_after_the_first_batch_of_a_large_transaction_loses_no_row()
+-> rustcdc::Result<()> {
+    kill_after_the_first_batch_of_a_large_transaction(true).await
+}
+
+/// The same, starting with no checkpoint while the slot already holds the transaction: the
+/// stream begins at the slot's `confirmed_flush_lsn`, and that — not the WAL head, which is
+/// past the transaction's commit record — is where its earlier events must resume.
+#[tokio::test]
+async fn runtime_postgres_process_kill_after_the_first_batch_of_a_backlogged_transaction_without_a_checkpoint_loses_no_row()
+-> rustcdc::Result<()> {
+    kill_after_the_first_batch_of_a_large_transaction(false).await
+}
+
+async fn kill_after_the_first_batch_of_a_large_transaction(
+    seed_checkpoint: bool,
+) -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres large-transaction crash test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    const ROWS: i64 = 3_000;
+    let error = |error: &dyn std::error::Error| rustcdc::Error::SourceError(error.to_string());
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_replication_slots=8",
+            "-c",
+            "max_wal_senders=8",
+        ])
+        .start()
+        .await
+        .map_err(|e| error(&e))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|e| error(&e))?
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|e| error(&e))?;
+    let (admin, connection) = tokio_postgres::connect(
+        &format!("host={host} port={port} user=postgres password=postgres dbname=cdc"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .map_err(|e| error(&e))?;
+    tokio::spawn(connection);
+    admin
+        .batch_execute(
+            "CREATE TABLE public.large_tx (id BIGINT PRIMARY KEY, v TEXT);
+             CREATE PUBLICATION large_tx_pub FOR TABLE public.large_tx;",
+        )
+        .await
+        .map_err(|e| error(&e))?;
+    let lsn_text: String = admin
+        .query_one(
+            "SELECT lsn::text FROM pg_create_logical_replication_slot('large_tx_slot', 'pgoutput')",
+            &[],
+        )
+        .await
+        .map_err(|e| error(&e))?
+        .get(0);
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
+    if seed_checkpoint {
+        let mut seed = FileCheckpoint::new(checkpoint_dir.path());
+        seed.save(
+            &PostgresOffset {
+                lsn: parse_pg_lsn(&lsn_text)?,
+                slot_name: "large_tx_slot".to_string(),
+                incremental_snapshot: None,
+            },
+            0,
+        )
+        .await?;
+    }
+
+    // One committed transaction, many times the worker's 256-event batch.
+    admin
+        .batch_execute(&format!(
+            "INSERT INTO public.large_tx SELECT g, 'row ' || g FROM generate_series(1, {ROWS}) g;"
+        ))
+        .await
+        .map_err(|e| error(&e))?;
+
+    let marker_file = checkpoint_dir.path().join("worker-large-tx.marker");
+    let mut worker = spawn_crash_worker(
+        &host,
+        port,
+        checkpoint_dir.path(),
+        &marker_file,
+        "large_tx_slot",
+        "large_tx_pub",
+        None,
+        true,
+        false,
+        // Per batch, the library default: acknowledging the first batch writes the
+        // checkpoint and confirms the slot, which is the write this test is about.
+        None,
+    )?;
+    wait_for_marker(&marker_file, Duration::from_secs(90))?;
+    let acked = read_worker_batch_len(&marker_file)?;
+    assert!(
+        acked > 0 && (acked as i64) < ROWS,
+        "the worker must acknowledge part of the transaction, not all of it: {acked}"
+    );
+    worker.kill().map_err(rustcdc::Error::IoError)?;
+    let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
+    wait_for_slot_released(&admin, "large_tx_slot").await?;
+
+    let mut runtime = CdcRuntime::new(
+        RuntimeConfig::new(
+            RuntimeSourceConfig::Postgres(PostgresSourceConfig {
+                host: host.clone(),
+                port,
+                user: "postgres".to_string(),
+                password: "postgres".into(),
+                database: "cdc".to_string(),
+                replication_slot_name: "large_tx_slot".to_string(),
+                publication_name: "large_tx_pub".to_string(),
+                stream_poll_interval_ms: 50,
+                max_events_per_poll: 1_000,
+                transport: rustcdc::TransportConfig::plaintext(),
+                ..PostgresSourceConfig::default()
+            }),
+            FileCheckpoint::new(checkpoint_dir.path()),
+            InMemorySchemaHistory::default(),
+        )
+        .with_max_buffer_size(1_000)
+        .with_max_poll_wait_ms(150),
+    )?;
+    runtime.start().await?;
+
+    let mut ids = std::collections::BTreeSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while (ids.len() as i64) < ROWS && std::time::Instant::now() < deadline {
+        let batch = runtime.poll_event_batch().await?;
+        ids.extend(
+            batch
+                .events()
+                .iter()
+                .filter(|event| event.op == Operation::Insert)
+                .filter_map(|event| {
+                    event
+                        .after
+                        .as_ref()?
+                        .get("id")?
+                        .as_str()?
+                        .parse::<i64>()
+                        .ok()
+                }),
+        );
+        runtime.commit_ack(batch.ack_mode()).await?;
+    }
+    let delivered = ids.len() as i64;
+    assert_eq!(
+        delivered,
+        ROWS,
+        "after the restart, {} of the transaction's {ROWS} rows never arrived; the first \
+         batch's acknowledgement moved the checkpoint past them",
+        ROWS - delivered
+    );
+    Ok(())
+}
+
 /// Block until PostgreSQL has released `slot`, or fail with a message that says why.
 ///
 /// `Child::kill` + `Child::wait` reap the *local* process. They say nothing about the

@@ -412,7 +412,7 @@ pub(super) async fn query_current_wal_lsn(client: &Client) -> Result<u64> {
     parse_pg_lsn(&lsn)
 }
 
-async fn query_slot_confirmed_lsn(client: &Client, slot_name: &str) -> Result<u64> {
+pub(super) async fn query_slot_confirmed_lsn(client: &Client, slot_name: &str) -> Result<u64> {
     let row = client
         .query_opt(
             "SELECT confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",

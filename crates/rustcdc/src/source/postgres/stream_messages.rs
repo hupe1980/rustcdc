@@ -527,18 +527,16 @@ impl PostgresStreamHandle {
             self.current_commit_ts
         };
         // pgoutput does not stamp a `RELATION` message with a position of its own, so the
-        // frame's `wal_start` is routinely `0`. That is fine while the event rides inside a
-        // transaction — `resume_offset_for` answers with the transaction's end LSN and the
-        // event's own offset is never checkpointed. Outside one it is not: that method
-        // returns `None` without transaction metadata, the runtime falls back to this
-        // offset, and a checkpoint at `0/00000000` resumes from the beginning of the slot.
+        // frame's `wal_start` is routinely `0`. Inside a transaction `resume_offset_for` usually
+        // answers for the event, but not once the transaction is past the tracking cap; outside
+        // one it returns `None`. Either way the runtime falls back to this offset, and a
+        // checkpoint at `0/00000000` would resume from the beginning of the slot.
         //
-        // The stream's current position is the truthful answer and it cannot rewind.
-        let lsn = if lsn == 0 {
-            self.stream.lsn_position
-        } else {
-            lsn
-        };
+        // The resume floor is the answer: the highest position a checkpoint of this stream can
+        // already hold, so it cannot rewind, and never past a transaction not yet delivered.
+        // `lsn_position` is not: without a checkpoint it starts at the WAL head, past any
+        // transaction the slot already holds, and a checkpoint there would skip its rows.
+        let lsn = if lsn == 0 { self.resume_floor } else { lsn };
         let captured = CapturedDdl {
             ddl_type: "ALTER_TABLE".to_string(),
             schema: relation.namespace.clone(),
@@ -552,6 +550,15 @@ impl PostgresStreamHandle {
             ts: ts_ms,
         };
         captured.to_event(&self.source_name, format_pg_lsn(lsn), ts_ms)
+    }
+
+    /// A standalone event — outside any transaction — checkpoints at its own offset, so no
+    /// later resume position may fall behind it. Read from the offset the event carries, the
+    /// one the runtime stores, rather than recomputed.
+    fn raise_resume_floor_to(&mut self, event: &Event) {
+        if let Ok(lsn) = super::parser::parse_pg_lsn(&event.source.offset) {
+            self.resume_floor = self.resume_floor.max(lsn);
+        }
     }
 
     pub(super) async fn process_messages(
@@ -575,15 +582,20 @@ impl PostgresStreamHandle {
                     }
                     self.current_xid = Some(begin.xid);
                     self.current_commit_ts = pg_timestamp_to_millis(begin.commit_timestamp_us);
+                    self.current_tx_start = self.resume_floor;
                     self.partial_tx_events.clear();
                 }
                 PgOutputMessage::Commit(commit) => {
                     self.stream.lsn_position = commit.end_lsn;
-                    // Remember where this transaction *ends*, which is the only position a
-                    // restart may resume from. See `PostgresStreamHandle::resume_offset_for`.
+                    self.resume_floor = self.resume_floor.max(commit.end_lsn);
+                    // Remember where this transaction starts and ends: its events resume from
+                    // the start until its last one. See `PostgresStreamHandle::resume_offset_for`.
                     if let Some(xid) = self.current_xid {
-                        self.committed_tx_ends
-                            .push_back((u64::from(xid), commit.end_lsn));
+                        self.committed_tx_ends.push_back((
+                            u64::from(xid),
+                            self.current_tx_start,
+                            commit.end_lsn,
+                        ));
                         while self.committed_tx_ends.len() > super::MAX_TRACKED_TX_ENDS {
                             self.committed_tx_ends.pop_front();
                         }
@@ -711,6 +723,7 @@ impl PostgresStreamHandle {
                             self.partial_tx_events.push(schema_event);
                         } else {
                             self.events_polled = self.events_polled.saturating_add(1);
+                            self.raise_resume_floor_to(&schema_event);
                             committed.push(schema_event);
                         }
                     }
@@ -737,6 +750,7 @@ impl PostgresStreamHandle {
                             self.partial_tx_events.push(event);
                         } else {
                             self.events_polled = self.events_polled.saturating_add(1);
+                            self.raise_resume_floor_to(&event);
                             committed.push(event);
                         }
                     }
