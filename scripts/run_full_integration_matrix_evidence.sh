@@ -35,7 +35,13 @@ postgres_process_crash_retry_delay_secs="${POSTGRES_PROCESS_CRASH_RETRY_DELAY_SE
 
 is_transient_sqlserver_failure() {
   local log_file="$1"
-  rg -qi "deadlock victim|code:\s*1205|timed out waiting for sql server|timeout.*sqlserver|temporar(y|ily) unavailable" "$log_file"
+  rg -qi "deadlock victim|code:\s*1205|timed out waiting for sql server|timeout.*sqlserver|temporar(y|ily) unavailable|connection refused" "$log_file"
+}
+
+# The cases that start the most SQL Server containers. A container that refuses connections
+# while it starts on a shared runner is the environment, not the connector; the retry is logged.
+is_sqlserver_container_case() {
+  [[ "$1" == "sqlserver snapshot" || "$1" == "sqlserver version matrix" ]]
 }
 
 is_transient_mysql_process_crash_failure() {
@@ -105,7 +111,7 @@ run_case() {
   echo "==> $label" | tee -a "$report_path"
   local attempts=1
   local max_attempts=1
-  if [[ "$label" == "sqlserver snapshot" ]]; then
+  if is_sqlserver_container_case "$label"; then
     max_attempts="$sqlserver_retry_attempts"
   elif [[ "$label" == "postgres process crash" ]]; then
     max_attempts="$postgres_process_crash_retry_attempts"
@@ -134,7 +140,7 @@ run_case() {
     cat "$temp_log" | tee -a "$report_path"
 
     if ((attempts < max_attempts)); then
-      if [[ "$label" == "sqlserver snapshot" ]] && is_transient_sqlserver_failure "$temp_log"; then
+      if is_sqlserver_container_case "$label" && is_transient_sqlserver_failure "$temp_log"; then
         transient=1
         echo "Transient SQL Server failure detected for '$label'; retrying in ${sqlserver_retry_delay_secs}s (attempt ${attempts}/${max_attempts})" | tee -a "$report_path"
         sleep "$sqlserver_retry_delay_secs"
