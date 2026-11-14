@@ -563,9 +563,10 @@ both the durable checkpoint and the source-side confirmation. For PostgreSQL:
 
 - a transaction's **last** event resumes from the COMMIT message's `end_lsn`, the position
   *after* the commit record;
-- every earlier event resumes from where the stream stood at the transaction's BEGIN. A
-  transaction larger than one batch is checkpointed part-way through, and a crash then replays
-  all of it rather than skipping its rest.
+- every earlier event resumes from where the stream stood at the transaction's BEGIN,
+  including one released before the connector read the COMMIT message because the transaction
+  outgrew `transaction_buffer_bytes`. A transaction larger than one batch is checkpointed
+  part-way through, and a crash then replays all of it rather than skipping its rest.
 
 *Limit:* the handle remembers the last 100 000 unconfirmed transactions; past that an event
 falls back to its own change position. A handle that wraps another stream, such as the
@@ -911,6 +912,11 @@ transaction whose remaining events have not arrived yet is **withheld** rather t
 delivered partially — including when the rest is simply still in flight from the source,
 which for a streaming connector is the normal case rather than the exception.
 
+
+A source buffer keeps the transaction whole too: under `PreserveTransactions` the runtime tells
+its source, through `Source::set_transaction_release`, not to release a transaction before its
+commit, and a PostgreSQL transaction larger than `transaction_buffer_bytes` stops the stream
+with a terminal error instead.
 
 **The one case this cannot honour:** a single transaction larger than `max_buffer_size` does not
 fit in any batch. Trimming it would produce an empty batch forever — a silent permanent stall,

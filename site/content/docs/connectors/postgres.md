@@ -185,10 +185,28 @@ restart. The directory is checked writable when the stream opens; under a read-o
 filesystem, mount an `emptyDir` and point `stream_spill_directory` at it. A full disk stops the
 pipeline with the I/O error; nothing is dropped.
 
-**The limits that do not change.** A committed transaction is still delivered as one unit, so
-its events are held in memory while they are, with or without streaming. And PostgreSQL cannot
-stream a transaction while a row's TOASTed value is only partly decoded: a transaction whose
-rows carry TOASTed values is mostly spilled on the primary, as under v1.
+**The committed transaction, in the connector.** Once PostgreSQL has committed a transaction,
+the connector decodes it and holds its events until it reads the COMMIT message, which is when
+the transaction's size is known: every event then carries it as `total_events`. That is
+bounded by `transaction_buffer_bytes` (256 MiB, measured as the events' estimated serialized
+size, not their larger size in memory). A transaction that outgrows it is handled by how the
+pipeline commits:
+
+- **at-least-once, batches may split transactions** (the default): its events are released
+  as they come, with `total_events: null` (`0` in Avro and Protobuf); only its last event,
+  held until the COMMIT message, carries the total. Every event released before the COMMIT
+  message resumes from where the stream stood at the transaction's BEGIN, so a crash part-way
+  replays the whole transaction: duplicates, never a gap.
+- **`delivery_contract = "effectively_once"`, or `transaction_boundary =
+  "preserve_transactions"`**: a part of the transaction cannot be delivered without delivering
+  it twice after a crash, so the stream stops with a terminal error naming the transaction and
+  `transaction_buffer_bytes`. Raise the limit above the transaction; the restart replays it.
+
+*Limits:* the release is decided by bytes, so changing `transaction_buffer_bytes` while a
+transaction is in flight changes which of its events carry `total_events`, and with it their
+idempotency fingerprint. And PostgreSQL cannot stream a transaction while a row's TOASTed
+value is only partly decoded: a transaction whose rows carry TOASTed values is mostly spilled
+on the primary, as under v1.
 
 **What you see meanwhile.** `/status` names the transaction under `source.open_transaction` —
 changes so far, bytes, on disk or not, since when — and the [console](@/docs/console.md) says
@@ -636,6 +654,7 @@ wal_transport = "streaming_replication"   # streaming_replication | sql_peek
 stream_in_progress_transactions = true    # false asks for pgoutput v1
 stream_buffer_memory_bytes      = 67108864
 # stream_spill_directory        = "/var/lib/rustcdc/spill"   # defaults to the system temp dir
+transaction_buffer_bytes        = 268435456  # one committed transaction's events, until its COMMIT
 
 # Polling
 stream_poll_interval_ms = 100
@@ -671,6 +690,7 @@ mode = "plaintext"    # plaintext | tls
 | `stream_in_progress_transactions` | `true` | Stream large transactions while they run (pgoutput v2, PostgreSQL 14+). Rows are still released at the commit — see [Large transactions](#large-transactions) |
 | `stream_buffer_memory_bytes` | `67108864` | Memory for streamed transactions not yet committed; past it a transaction spills to disk |
 | `stream_spill_directory` | system temp dir | Where streamed transactions spill; must be writable |
+| `transaction_buffer_bytes` | `268435456` | One transaction's events held until its COMMIT message. Past it the events are released early, or the stream stops when transactions must stay whole — see [Large transactions](#large-transactions). Must be > 0 |
 | `conn_timeout_secs` | `30` | Connection timeout in seconds |
 | `stream_poll_interval_ms` | `50` | Stream poll interval; under `streaming_replication` the server pushes, so this bounds the idle backstop rather than delivery latency |
 | `max_events_per_poll` | `1000` | Maximum events yielded per poll cycle |

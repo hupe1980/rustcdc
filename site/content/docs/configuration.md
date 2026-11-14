@@ -78,6 +78,7 @@ wal_transport = "streaming_replication"   # streaming_replication | sql_peek
 stream_in_progress_transactions = true       # false asks for pgoutput v1
 stream_buffer_memory_bytes      = 67108864   # past it, a transaction spills to disk
 # stream_spill_directory        = "/var/lib/rustcdc/spill"   # defaults to the system temp dir
+transaction_buffer_bytes        = 268435456  # one transaction's events until its COMMIT; see the connector guide
 
 stream_poll_interval_ms = 100
 max_events_per_poll     = 1000

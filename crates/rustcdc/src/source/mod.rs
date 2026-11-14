@@ -647,8 +647,9 @@ pub trait StreamHandle: Send + Sync {
     /// not yet delivered, which a crash then loses. The PostgreSQL handle returns `end_lsn`
     /// for the last event and, for every other, the highest position the stream had reached
     /// at the transaction's BEGIN (its start, a committed end, or a standalone event's own
-    /// offset) — so a restart part-way through replays the whole transaction. A handle that
-    /// wraps another stream must forward this.
+    /// offset) — including an event released before the handle read the COMMIT, because the
+    /// transaction outgrew its buffer — so a restart part-way through replays the whole
+    /// transaction. A handle that wraps another stream must forward this.
     ///
     /// *Limit:* the PostgreSQL handle remembers the boundaries of the last 100,000
     /// transactions not yet confirmed. Past that it returns `None` for an evicted transaction's
