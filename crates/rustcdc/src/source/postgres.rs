@@ -2266,6 +2266,36 @@ mod tests {
             );
         }
 
+        /// One row larger than the limit is past it too: a stream that must keep
+        /// transactions whole fails on it, whatever else the transaction holds.
+        #[tokio::test]
+        async fn a_whole_transaction_of_one_oversized_row_fails_the_stream() {
+            let big = "x".repeat(2_000);
+            let mut handle = handle(
+                vec![vec![
+                    xlog(100, build_relation(OID, "public", "t", &[("id", true)])),
+                    xlog(110, build_relation(OID + 1, "public", "u", &[("id", true)])),
+                    xlog(200, build_begin(900, 0, 7)),
+                    // Rows of an excluded table are never held, so the oversized row is the
+                    // only event the buffer sees.
+                    xlog(210, build_insert(OID + 1, &[Some("1")])),
+                    xlog(220, build_insert(OID, &[Some(big.as_str())])),
+                    xlog(230, build_insert(OID + 1, &[Some("2")])),
+                    xlog(900, build_commit(900, 950, 0)),
+                ]],
+                TransactionRelease::Whole,
+            );
+            handle.table_exclude_list = vec!["public.u".to_string()];
+            let error = handle
+                .next_events(100)
+                .await
+                .expect_err("a single row past the limit is past it");
+            assert!(
+                matches!(error, crate::core::Error::Unrecoverable(_)),
+                "{error:?}"
+            );
+        }
+
         /// Under the limit, a transaction comes out exactly as before: whole, at its commit.
         #[tokio::test]
         async fn a_transaction_under_the_limit_is_released_whole_at_its_commit() {

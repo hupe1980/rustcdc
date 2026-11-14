@@ -77,6 +77,8 @@ impl TransactionBuffer {
     /// Empty while the transaction fits. Past the limit under [`TransactionRelease::Early`],
     /// every held event but the newest: keeping one back means the transaction's last
     /// event is always still held at the commit, and carries the total that marks its end.
+    /// So one event is held whatever its size. Under [`TransactionRelease::Whole`], any
+    /// event that takes the transaction past the limit fails it, a lone one included.
     pub(crate) fn push(&mut self, mut event: Event) -> Result<Vec<Event>> {
         if let Some(tx) = event.transaction.as_mut() {
             tx.event_index = self.next_index;
@@ -87,11 +89,14 @@ impl TransactionBuffer {
             .saturating_add(event.estimated_serialized_bytes() as u64);
         self.events.push(event);
 
-        if self.bytes <= self.limit_bytes || self.events.len() < 2 {
+        if self.bytes <= self.limit_bytes {
             return Ok(Vec::new());
         }
         match self.release {
             TransactionRelease::Whole => Err(self.overflow_error()),
+            // The newest is always kept, even alone past the limit: the transaction's last
+            // event must still be held at the commit to carry the total.
+            TransactionRelease::Early if self.events.len() < 2 => Ok(Vec::new()),
             TransactionRelease::Early => {
                 let newest = self.events.pop().expect("at least two events are held");
                 self.bytes = newest.estimated_serialized_bytes() as u64;
