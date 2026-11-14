@@ -467,12 +467,15 @@ async fn send_event_with_timeout(
     // The size limit is enforced by `SinkBinding` against the *encoded* payload — see
     // `crate::sink::SinkBinding::max_event_bytes`, so a non-JSON codec is measured by
     // the bytes it transmits.
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(sink_send_timeout_ms),
-        sink.send(event),
-    )
-    .await
-    {
+    let mut send = std::pin::pin!(sink.send(event));
+    // Most sends complete on their first poll; only one that waits is given a timer.
+    let outcome = match futures::poll!(send.as_mut()) {
+        std::task::Poll::Ready(result) => Ok(result),
+        std::task::Poll::Pending => {
+            tokio::time::timeout(std::time::Duration::from_millis(sink_send_timeout_ms), send).await
+        }
+    };
+    match outcome {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(AppError::Runtime(err)),
         Err(_) => Err(AppError::SinkTimeout(format!(

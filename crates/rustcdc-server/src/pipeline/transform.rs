@@ -471,6 +471,10 @@ impl TransformPipeline {
     }
 
     pub async fn apply(&self, event: Event) -> Result<Option<Event>> {
+        // Nothing to apply: the row, and so its shape, cannot change.
+        if self.rules.is_empty() && matches!(self.runtime, TransformRuntime::Native) {
+            return Ok(Some(event));
+        }
         // The shape the row claimed on the way in. A rule — or a WASM module, which may
         // rewrite the payload wholesale — that changes the columns invalidates the claim.
         let shape = ShapeGuard::capture(&event);
@@ -1537,6 +1541,20 @@ mod tests {
             .await
             .expect("apply")
             .expect("kept")
+    }
+
+    /// With nothing to apply the event leaves exactly as it came, shape included.
+    #[tokio::test]
+    async fn an_empty_pipeline_returns_the_event_unchanged_with_its_shape() {
+        let event = shaped_nested_event();
+        let out = TransformPipeline::from_config(TransformRuntimeConfig::default(), Vec::new())
+            .expect("pipeline")
+            .apply(event.clone())
+            .await
+            .expect("apply")
+            .expect("kept");
+        assert!(out.shape.is_some());
+        assert_eq!(out, event);
     }
 
     #[tokio::test]
