@@ -3116,7 +3116,7 @@ mod tests {
         );
 
         // A column whose value IS present must never be reported unavailable.
-        assert!(!events[0].unavailable_columns.contains(&"title".to_string()));
+        assert!(!events[0].unavailable_columns.iter().any(|i| i == "title"));
     }
 
     /// Decode one FULL-identity UPDATE of `docs(id, title, body)` and return the event.
