@@ -349,10 +349,8 @@ process-kill crash tests are part of the suite, and are available to *your* test
 From the repository root:
 
 ```bash
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test -p rustcdc --lib --all-features
-cargo test -p rustcdc --doc --all-features
-cargo xtask policy-gate
+cargo xtask gate                            # fmt, clippy, unit tests, policy
+cargo test -p rustcdc --doc --all-features  # the examples in these docs
 ```
 
 Foundation-only profile, without any connector:

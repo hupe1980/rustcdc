@@ -397,23 +397,28 @@ require_file_present() {
 # `lib:` the library · `server:` the binary · `workspace:` both · `release:` the tag
 # pipeline. `CI` is the aggregator branch protection requires and is deliberately bare.
 run_release_evidence_contract_check() {
-  # `release.yml` gates every release on an artifact that `ci.yml` uploads. That name is
-  # the only contract between the two files, and nothing else would notice it breaking:
-  # the release simply fails at the tag, which is the worst moment to find out.
+  # The release gates on an artifact that `ci.yml` uploads; `release.yml` and
+  # `cargo xtask release-ready` read its name from `scripts/release-ready.sh`. That name is
+  # the only contract between the two, and nothing else would notice it breaking: the
+  # release simply fails at the tag, which is the worst moment to find out.
   #
   # The contract is the artifact name, not a job name: the GitHub API returns a job's
   # display name, which a rename changes silently.
   local expected uploaded
-  expected="$(rg -o --no-heading --no-line-number \
-    "const EVIDENCE_ARTIFACT = '([^']+)'" -r '$1' .github/workflows/release.yml || true)"
+  expected="$(rg -o --no-heading --no-line-number '^EVIDENCE=(\S+)$' -r '$1' \
+    scripts/release-ready.sh || true)"
   if [[ -z "$expected" ]]; then
-    echo "FAIL: .github/workflows/release.yml no longer declares EVIDENCE_ARTIFACT." >&2
+    echo "FAIL: scripts/release-ready.sh no longer declares EVIDENCE." >&2
+    exit 1
+  fi
+  if ! rg -q 'scripts/release-ready\.sh' .github/workflows/release.yml; then
+    echo "FAIL: release.yml no longer runs scripts/release-ready.sh before releasing." >&2
     exit 1
   fi
 
   uploaded="$(rg -n --no-heading "name: ${expected}\$" .github/workflows/ci.yml || true)"
   if [[ -z "$uploaded" ]]; then
-    echo "FAIL: release.yml gates on artifact '${expected}', which ci.yml never uploads." >&2
+    echo "FAIL: the release gates on artifact '${expected}', which ci.yml never uploads." >&2
     echo "The release would fail at the tag. Keep both ends of the name in step." >&2
     exit 1
   fi
@@ -631,8 +636,8 @@ run_workflow_drift_check() {
   require_match "verify successful release-evidence run exists for this commit" \
     "$RELEASE_WORKFLOW" "the release gate checks CI passed for this exact commit"
   require_match "does not match Cargo.toml version" "$RELEASE_WORKFLOW" "tag/version agreement check"
-  # Every job in `release-evidence`'s `needs:` is a gate the release depends on
-  # transitively. These four are the ones whose loss would be least visible.
+  # Every job the `CI` aggregator needs is a gate the release depends on: the release
+  # requires a successful run. These four are the ones whose loss would be least visible.
   for required_gate in quality policy-gate server-test server-check; do
     if ! rg -q "^      - ${required_gate}$|^ +- ${required_gate}$" "$CI_WORKFLOW"; then
       echo "FAIL: ${required_gate} is not required by anything in ${CI_WORKFLOW}" >&2

@@ -33,10 +33,8 @@ uncontrolled duplication are release-critical.
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test -p rustcdc --lib --all-features
-cargo test -p rustcdc-server --lib --all-features
-cargo xtask policy-gate            # the gate a pull request must pass
+cargo xtask gate    # what CI fails a pull request on, minus Docker: fmt, clippy, the library's
+                    # unit tests, every server test target, the policy checks. Exit code is the verdict
 ```
 
 Also run when relevant:
@@ -74,6 +72,15 @@ Three ways these mislead:
   rebuild them, so a source change can be invisible to the suite that exercises it.
 - **`--test-threads=1` is required for the server suites.** In parallel they contend for
   container names and ports and fail for reasons unrelated to the change.
+
+## Releasing
+
+1. Bump the version and write the `CHANGELOG.md` entry on a branch; merge its pull request.
+2. Wait for CI **on main** for the merge commit (~70 min). The pull request's run does not count:
+   the release reads the evidence only main's run uploads.
+3. `cargo xtask release-ready` answers whether that commit can be tagged, and prints the command
+   when it can.
+4. Push the tag; `release.yml` does the rest, checking the same thing first.
 
 ## Standing rules
 

@@ -508,14 +508,8 @@ Images are built on distroless/cc (no shell, no package manager), signed with SL
 ## 🧪 Development
 
 ```bash
-# Lint (warnings-as-errors, all targets, all features)
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-# Unit tests
-cargo test -p rustcdc-server --lib --all-features
-
-# The gate a pull request must pass
-cargo xtask policy-gate
+# What CI fails a pull request on, minus Docker: fmt, clippy, tests, policy
+cargo xtask gate
 
 # Audit licenses and duplicate dependencies (--all-features matches CI and the
 # published image; a narrower run reports the duplicate skips as unnecessary)
