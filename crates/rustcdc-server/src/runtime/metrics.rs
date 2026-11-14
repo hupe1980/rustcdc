@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::time::Instant;
 
 use rustcdc::core::RuntimeAdminSnapshot;
-use rustcdc::{Event, fingerprint_event_stable};
+use rustcdc::{Event, fingerprint_event_transient};
 
 use super::batch;
 use super::recovery::RecoverableErrorSnapshot;
@@ -149,7 +149,8 @@ pub(crate) struct CorrectnessSample {
     pub(crate) source_offset: String,
     pub(crate) source_timestamp: u64,
     pub(crate) event_timestamp: u64,
-    pub(crate) fingerprint: Option<String>,
+    /// In-process only: the window it is compared against never leaves this process.
+    pub(crate) fingerprint: Option<u128>,
 }
 
 impl CorrectnessSample {
@@ -161,7 +162,7 @@ impl CorrectnessSample {
             source_offset: event.source.offset.clone(),
             source_timestamp: event.source.timestamp,
             event_timestamp: event.ts,
-            fingerprint: fingerprint_event_stable(event).ok(),
+            fingerprint: fingerprint_event_transient(event).ok(),
         }
     }
 }
@@ -1731,8 +1732,8 @@ pub(crate) struct RuntimeLoopMetricsAccumulator {
     stream_correctness: BTreeMap<String, StreamCorrectnessMetricsAccumulator>,
     stream_last_source_ts_ms: HashMap<String, u64>,
     stream_last_source_sequence: HashMap<String, u64>,
-    recent_fingerprints: HashSet<(String, String)>,
-    recent_fingerprint_window: VecDeque<(String, String)>,
+    recent_fingerprints: HashSet<(String, u128)>,
+    recent_fingerprint_window: VecDeque<(String, u128)>,
     dedup_window_size: usize,
     sink_queue_depth_last: u64,
     sink_queue_depth_window: VecDeque<u64>,
@@ -2246,8 +2247,8 @@ impl RuntimeLoopMetricsAccumulator {
         let mut reordered = false;
         let mut ack_lag_ms: Option<u64> = None;
 
-        if let Some(fingerprint) = &sample.fingerprint {
-            let fp_key = (stream_slot.clone(), fingerprint.clone());
+        if let Some(fingerprint) = sample.fingerprint {
+            let fp_key = (stream_slot.clone(), fingerprint);
             if self.recent_fingerprints.contains(&fp_key) {
                 duplicate = true;
             } else {
@@ -2727,6 +2728,30 @@ mod tests {
             Some(42)
         );
         assert_eq!(parse_numeric_offset_component("offset=abc"), None);
+    }
+
+    /// The same event delivered twice counts once as a duplicate; a different event does not.
+    #[test]
+    fn a_redelivered_event_counts_as_a_duplicate_and_a_new_one_does_not() {
+        let mut metrics = RuntimeLoopMetricsAccumulator::new(
+            "stdout",
+            "at_least_once",
+            true,
+            "at_least_once",
+            false,
+            false,
+            128,
+            50_000,
+        );
+        let first = sample_event("postgres", "0/10", 1_000, 1_000);
+        let second = sample_event("postgres", "0/11", 1_001, 1_001);
+
+        metrics.record_correctness_sample(&CorrectnessSample::from_event(&first));
+        metrics.record_correctness_sample(&CorrectnessSample::from_event(&second));
+        assert_eq!(metrics.data_duplicates_total, 0);
+
+        metrics.record_correctness_sample(&CorrectnessSample::from_event(&first));
+        assert_eq!(metrics.data_duplicates_total, 1);
     }
 
     #[test]
