@@ -436,17 +436,14 @@ async fn the_startup_packet_and_replication_command_reach_the_server_intact() {
     assert!(
         observed
             .startup_params
-            .contains(&"replication=database".to_string()),
+            .iter()
+            .any(|i| i == "replication=database"),
         "logical decoding is per-database, so the startup packet must ask for \
          `replication=database` rather than `true`: {:?}",
         observed.startup_params
     );
-    assert!(observed.startup_params.contains(&"user=cdc".to_string()));
-    assert!(
-        observed
-            .startup_params
-            .contains(&"database=app".to_string())
-    );
+    assert!(observed.startup_params.iter().any(|i| i == "user=cdc"));
+    assert!(observed.startup_params.iter().any(|i| i == "database=app"));
 
     let query = &observed.replication_query;
     assert!(

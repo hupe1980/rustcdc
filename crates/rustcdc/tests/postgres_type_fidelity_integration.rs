@@ -503,7 +503,8 @@ async fn postgres_unchanged_toast_is_completed_from_the_old_tuple_under_replica_
     assert!(
         !update
             .unavailable_columns
-            .contains(&"big_changed".to_string()),
+            .iter()
+            .any(|i| i == "big_changed"),
         "a column that genuinely changed must never be marked unavailable, or a correct \
          sink skips writing it: {:?}",
         update.unavailable_columns
@@ -551,7 +552,7 @@ async fn postgres_unchanged_toast_is_completed_from_the_old_tuple_under_replica_
         .find(|event| event.op == Operation::Update)
         .expect("expected the DEFAULT-identity update");
     assert!(
-        update.unavailable_columns.contains(&"big_kept".to_string()),
+        update.unavailable_columns.iter().any(|i| i == "big_kept"),
         "without a FULL old tuple the hole must stay reported: {:?}",
         update.unavailable_columns
     );

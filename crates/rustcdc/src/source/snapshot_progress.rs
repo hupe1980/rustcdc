@@ -274,8 +274,8 @@ mod tests {
 
         let pending = progress.get_pending_tables();
         assert_eq!(pending.len(), 2);
-        assert!(pending.contains(&"orders".to_string()));
-        assert!(pending.contains(&"products".to_string()));
+        assert!(pending.iter().any(|i| i == "orders"));
+        assert!(pending.iter().any(|i| i == "products"));
     }
 
     #[test]

@@ -249,8 +249,8 @@ mod tests {
         state.mark_table_complete("users").unwrap();
         let pending = state.get_pending_tables().unwrap();
         assert_eq!(pending.len(), 2);
-        assert!(pending.contains(&"orders".to_string()));
-        assert!(pending.contains(&"products".to_string()));
+        assert!(pending.iter().any(|i| i == "orders"));
+        assert!(pending.iter().any(|i| i == "products"));
     }
 
     #[test]
