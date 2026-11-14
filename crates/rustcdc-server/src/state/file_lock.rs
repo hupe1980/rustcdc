@@ -16,8 +16,8 @@ use crate::error::AppError;
 
 /// The outcome of [`try_lock`].
 pub(crate) enum TryLock {
-    /// Locked. The lock lasts as long as this handle.
-    Held(File),
+    /// Locked, until the [`HeldLock`] is released or dropped.
+    Held(HeldLock),
     /// Another open handle holds it: a live process, here or on a filesystem that
     /// propagates locks.
     Busy,
@@ -40,9 +40,42 @@ pub(crate) fn try_lock(path: &Path) -> Result<TryLock, AppError> {
             ))
         })?;
     match file.try_lock() {
-        Ok(()) => Ok(TryLock::Held(file)),
+        Ok(()) => Ok(TryLock::Held(HeldLock { file })),
         Err(TryLockError::WouldBlock) => Ok(TryLock::Busy),
         Err(TryLockError::Error(error)) => Ok(TryLock::Unsupported(error)),
+    }
+}
+
+/// A lock this process holds.
+///
+/// Released explicitly, not by closing the handle: the lock belongs to the open file
+/// description, and a child process holds a copy of that from its creation until it execs.
+/// Closing ours alone would leave the lock held for that window, refusing a successor
+/// that the release was meant to admit.
+pub(crate) struct HeldLock {
+    file: File,
+}
+
+impl HeldLock {
+    /// The locked file, for writing diagnostics into it.
+    pub(crate) fn file(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    /// Where this lock is visible; see [`lock_domain`].
+    pub(crate) fn domain(&self) -> Option<LockDomain> {
+        lock_domain(&self.file)
+    }
+
+    /// Release the lock for every copy of its description.
+    pub(crate) fn release(self) -> std::io::Result<()> {
+        self.file.unlock()
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -63,7 +96,7 @@ pub(crate) struct LockDomain {
 
 /// The domain of a lock held on `file`; `None` where the platform does not expose a boot id
 /// or a device number.
-pub(crate) fn lock_domain(file: &File) -> Option<LockDomain> {
+fn lock_domain(file: &File) -> Option<LockDomain> {
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|id| id.trim().to_string())
@@ -97,7 +130,7 @@ mod tests {
         let path = dir.path().join("probe.lock");
 
         let first = match try_lock(&path).expect("open") {
-            TryLock::Held(file) => file,
+            TryLock::Held(lock) => lock,
             _ => panic!("the first handle must lock"),
         };
         assert!(matches!(try_lock(&path).expect("open"), TryLock::Busy));

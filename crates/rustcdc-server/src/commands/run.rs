@@ -563,7 +563,7 @@ fn ensure_state_layout(app_config: &AppConfig) -> Result<(), AppError> {
 // it exits, so it needs no PID check and no external program to tell a crash from a live
 // process.
 struct StateDirLock {
-    _file: Option<std::fs::File>,
+    _lock: Option<crate::state::file_lock::HeldLock>,
 }
 
 impl StateDirLock {
@@ -574,14 +574,14 @@ impl StateDirLock {
 
         let lock_path = state_dir.join(Self::LOCK_FILE);
         match crate::state::file_lock::try_lock(&lock_path)? {
-            crate::state::file_lock::TryLock::Held(mut file) => {
+            crate::state::file_lock::TryLock::Held(mut lock) => {
                 // For an operator reading the file; nothing decides on it. The file is not
                 // removed on exit: the lock dies with the process, and deleting a lock file
                 // races a successor that opened the old one.
-                let _ = file.set_len(0);
-                let _ = writeln!(file, "{}", std::process::id());
+                let _ = lock.file().set_len(0);
+                let _ = writeln!(lock.file(), "{}", std::process::id());
                 tracing::debug!(path = %lock_path.display(), "acquired state-dir lock");
-                Ok(Self { _file: Some(file) })
+                Ok(Self { _lock: Some(lock) })
             }
             crate::state::file_lock::TryLock::Busy => Err(AppError::Other(format!(
                 "another rustcdc process is already running against state directory '{}' \
@@ -596,7 +596,7 @@ impl StateDirLock {
                     "the filesystem refused an advisory lock on the state directory; a \
                      second process on this host is not refused by it"
                 );
-                Ok(Self { _file: None })
+                Ok(Self { _lock: None })
             }
         }
     }

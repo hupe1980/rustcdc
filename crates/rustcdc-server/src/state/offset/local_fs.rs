@@ -10,7 +10,7 @@ use rustcdc::core::{Error as RtError, Offset};
 use crate::error::AppError;
 
 use crate::state::CheckpointAgeSource;
-use crate::state::file_lock::{self, LockDomain, TryLock};
+use crate::state::file_lock::{self, HeldLock, LockDomain, TryLock};
 use crate::state::remote_lease::{self, LEASE_HEARTBEAT, LEASE_TTL, LeaseRecord};
 
 /// The owner lease file, beside the checkpoint it protects.
@@ -73,7 +73,7 @@ pub(crate) struct OwnedStateDir {
     last_renewed_ms: AtomicU64,
     /// The advisory lock, held until [`release`](Self::release) or drop. `None` when the
     /// filesystem refused to lock; the lease alone decides then.
-    lock: std::sync::Mutex<Option<std::fs::File>>,
+    lock: std::sync::Mutex<Option<HeldLock>>,
 }
 
 impl OwnedStateDir {
@@ -127,8 +127,15 @@ impl OwnedStateDir {
 
     /// Release the lock and the lease, so a successor need not wait out the TTL.
     pub(crate) fn release(&self) {
-        if let Ok(mut lock) = self.lock.lock() {
-            lock.take();
+        if let Ok(mut lock) = self.lock.lock()
+            && let Some(lock) = lock.take()
+            && let Err(error) = lock.release()
+        {
+            tracing::warn!(
+                error = %error,
+                "could not release the local_fs state directory's lock; a successor is \
+                 refused until this process exits"
+            );
         }
         // The lease only if we still hold it: a fenced-out instance deleting the file would
         // hand the directory to a third process while the real owner is still writing.
@@ -251,7 +258,7 @@ fn acquire_with(
         }
     };
 
-    let domain = lock.as_ref().and_then(file_lock::lock_domain);
+    let domain = lock.as_ref().and_then(HeldLock::domain);
     let existing = read_lease(&path)?;
     let epoch = match &existing {
         // We hold the lock, and the lease's owner held it in the same domain: it would
@@ -967,6 +974,47 @@ mod lease_tests {
             .err()
             .expect("an owner that never held the lock must be fenced by its lease");
         drop(first);
+    }
+
+    /// A released directory can be taken at once even while this process starts others.
+    ///
+    /// A child process holds a copy of every open file description from its creation until
+    /// it execs. Dropping our handle then leaves the lock held by the child's copy; only an
+    /// explicit unlock releases it for every copy.
+    #[test]
+    fn a_released_directory_is_takeable_at_once_while_processes_spawn() {
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let exe = std::env::current_exe().expect("test binary");
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new(&exe)
+                            .args(["--exact", "no::such::test"])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                })
+            })
+            .collect();
+
+        let mut refused = 0;
+        for _ in 0..300 {
+            match acquire_state_dir(dir.path()) {
+                Ok(owner) => owner.release(),
+                Err(_) => refused += 1,
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().expect("spawner");
+        }
+        assert_eq!(refused, 0, "a released directory must be takeable at once");
     }
 
     /// An unparseable lease is replaced rather than being fatal.
