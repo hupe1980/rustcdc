@@ -1,4 +1,4 @@
-//! Pipeline assembly: build a [`TableRouter`] from configuration.
+//! Pipeline assembly: build a [`rustcdc::TableRouter`] from configuration.
 
 use crate::config::schema::AppConfig;
 use crate::error::AppError;
@@ -192,9 +192,9 @@ fn assign_known_tables(
 ///
 /// * a route naming a sink that does not exist — a typo, or a missing `[[sinks]]` entry;
 /// * a `[[sinks]]` entry no route names — inert configuration, and the shape a mistyped
-///   route leaves behind. It used to be built, connected and dropped unused;
+///   route leaves behind, which would otherwise be built, connected and dropped unused;
 /// * two routes naming the same sink — one binding cannot serve two routes, and the
-///   second route silently lost its sink before this check existed.
+///   second route would otherwise silently lose its sink.
 fn validate_route_references(
     routes: &[crate::config::pipeline::RouteConfig],
     sinks: &[crate::config::sink::NamedSinkConfig],
@@ -309,9 +309,9 @@ mod tests {
         assert!(err.to_string().contains("arcive"), "{err}");
     }
 
-    /// Two routes cannot share one binding, and before this check the second route
-    /// silently lost its sink to the first: `named_sink_map.remove` had already consumed
-    /// it, so the pipeline reported "unknown sink" for a sink that was plainly declared.
+    /// Two routes cannot share one binding. Without this check the second route silently
+    /// loses its sink to the first: `named_sink_map.remove` has already consumed it, so the
+    /// pipeline reports "unknown sink" for a sink that is plainly declared.
     #[test]
     fn two_routes_referencing_one_sink_are_refused_with_the_real_reason() {
         let sinks = vec![stdout_sink("archive")];
@@ -395,17 +395,16 @@ mod tests {
 
     /// The regression this whole side channel exists for.
     ///
-    /// The scrape path used to read counters back through `TableRouter`, whose
-    /// `SinkAdapter::delivery_metrics()` carries four generic fields. Thirty families —
-    /// every HTTP status class, both retry histograms, pending bytes, the Iceberg
-    /// counters, Kafka OAUTHBEARER token health — have no room in those four and rendered
-    /// a constant zero for the life of the process. Four shipped alert rules watched four
-    /// of them and could never fire.
+    /// Reading counters back through `TableRouter` would go through
+    /// `SinkAdapter::delivery_metrics()`, which carries four generic fields. Thirty families
+    /// — every HTTP status class, both retry histograms, pending bytes, the Iceberg
+    /// counters, Kafka OAUTHBEARER token health — have no room in those four and would
+    /// render a constant zero, and the shipped alert rules on them could never fire.
     ///
     /// The assertion is deliberately on `http_requests_total`, which is **not**
     /// representable in `rustcdc::sink::SinkDeliveryMetrics`: reverting to the router path
     /// puts it back to zero and fails this test. Asserting on `retries_total` would not —
-    /// that one field did survive.
+    /// that field fits the router path.
     #[tokio::test]
     async fn extended_sink_counters_reach_the_registry_through_the_router() {
         use rustcdc::core::{Event, Operation, SourceMetadata};

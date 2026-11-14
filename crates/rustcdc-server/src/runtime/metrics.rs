@@ -16,12 +16,10 @@ use crate::state;
 
 /// Histogram bounds in **microseconds**, exported as seconds.
 ///
-/// Latency was previously captured with `as_millis()` against bounds starting at 1 ms.
 /// Per-event work is microseconds — a JSON encode of a representative event measures
-/// 13.9 us — so every observation truncated to `0` and landed in the `le="1"` bucket.
-/// `_sum` accumulated zeros, every quantile returned the same bucket floor, and a 90x
-/// regression produced no change in any exported series. That is how the double-encode
-/// on the send path (a measured 13.9 us per event) stayed invisible.
+/// 13.9 us — so millisecond capture would truncate every observation to `0`: `_sum`
+/// would accumulate zeros, every quantile would return one bucket floor, and a 90x
+/// regression would change no exported series.
 ///
 /// These bounds span both regimes in one family: 100 us to 5 ms covers per-event
 /// transform, prepare and encode work; 10 ms to 5 s covers network sinks and
@@ -76,10 +74,9 @@ pub(crate) fn observe_latency_histogram_bucket(
 
 /// Plain arithmetic mean. No unit conversion — use for ratios and counts.
 ///
-/// This exists separately from [`average_latency_seconds`] because the latency helper
-/// used to be a general-purpose mean, and converting *it* to seconds silently divided
-/// a reorder **ratio** by a million. A helper whose name promises a unit must not be
-/// reachable from a call site that has no unit.
+/// Separate from [`average_latency_seconds`], which converts to seconds: used for a
+/// reorder **ratio**, it would silently divide it by a million. A helper whose name
+/// promises a unit must not be reachable from a call site that has no unit.
 fn mean(total: u64, sample_count: u64) -> f64 {
     if sample_count == 0 {
         0.0
@@ -328,7 +325,7 @@ impl PrometheusTextEncoder {
             let _ = writeln!(self.output, "# TYPE {name} histogram");
         }
 
-        // Hoisted: this used to be re-`format!`ed once per bucket per series per scrape.
+        // Hoisted out of the per-bucket, per-series loop.
         let bucket_name = format!("{name}_bucket");
 
         let mut cumulative_count = 0u64;
@@ -2609,13 +2606,10 @@ mod tests {
 
     /// One unchanging stall must log once, not once per health tick.
     ///
-    /// `observe_health_transition` runs on every poll of the event loop. Its guard
-    /// compared the whole `HealthVerdict`, and `Stalled` carries a `reason` string with
-    /// the elapsed milliseconds inside it — so two evaluations of the *same* stall a tick
-    /// apart were never equal, the guard never matched, and a single stalled pipeline
-    /// emitted a WARN on every tick forever. Observed in the field at roughly ten a
-    /// second, with `previous="stalled"` in the line: the code believed it was reporting
-    /// a transition into a state it was already in.
+    /// `observe_health_transition` runs on every poll of the event loop, and `Stalled`
+    /// carries a `reason` string with the elapsed milliseconds inside it. A guard comparing
+    /// the whole `HealthVerdict` would never match two evaluations of the *same* stall a
+    /// tick apart, and a single stalled pipeline would emit a WARN on every tick forever.
     #[test]
     fn an_unchanging_stall_logs_once_not_once_per_tick() {
         use tracing_subscriber::layer::SubscriberExt;
@@ -2868,9 +2862,8 @@ mod tests {
         }))
         .expect("snapshot deserializes");
 
-        // The library's renderer — the only one. This crate used to have a second copy
-        // that emitted a different name for the slot lag, omitted three families, and
-        // carried no `source_type` label at all.
+        // The library's renderer — the only one; a second copy in this crate would drift
+        // from it in names, families and labels.
         let mut rendered = Vec::new();
         rustcdc::core::write_runtime_metrics_prometheus(&snapshot, &mut rendered)
             .expect("writing to a Vec is infallible");

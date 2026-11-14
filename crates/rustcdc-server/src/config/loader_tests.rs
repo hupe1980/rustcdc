@@ -3369,9 +3369,9 @@ dir = "{}"
     )
     .expect("write config");
 
-    // Scoped to the `load` call that needs it. The old code set this variable and never
-    // removed it, so every later test in the binary ran with it present — which is how a
-    // test that depends on an ambient variable passes locally and fails in isolation.
+    // Scoped to the `load` call that needs it: a variable left set leaks into every later
+    // test in the binary, which is how a test that depends on an ambient variable passes
+    // locally and fails in isolation.
     let _env = crate::test_env::EnvGuard::set(&[("CDC_TEST_SOURCE_PASSWORD", "pg-secret")]);
     load(&config_path).expect("config should load")
 }
@@ -3706,8 +3706,8 @@ key = "whsec_bGl0ZXJhbHNlY3JldGxpdGVyYWxzZWNyZXQ="
 
 /// The error names the block the operator has to edit.
 ///
-/// It used to say `sink.http.bearer_token` for every position, so a literal token in the
-/// third of four named sinks reported a path that does not exist in the document.
+/// A fixed `sink.http.bearer_token` would report a path that does not exist in the
+/// document for a literal token in the third of four named sinks.
 #[test]
 fn a_literal_secret_in_a_named_sink_is_reported_against_that_sink() {
     let dir = tempfile::tempdir().expect("tempdir");

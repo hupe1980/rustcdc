@@ -361,11 +361,10 @@ impl TransformPipeline {
             // Recomputed per stage, and keyed by table rather than by position, because
             // neither alternative works. A `Vec<bool>` captured once before the first
             // stage cannot survive `apply_batch`, which is allowed to drop events, so the
-            // indices stop lining up; and a batch-wide "did anything have a key" flag —
-            // which is what this used to be — fires on an event that **never** had one.
-            // A batch mixing a keyed table with a keyless one (no primary key, or
-            // `REPLICA IDENTITY NOTHING`) then failed on every poll, permanently, for any
-            // pipeline with a transform configured.
+            // indices stop lining up; and a batch-wide "did anything have a key" flag
+            // fires on an event that **never** had one, so a batch mixing a keyed table
+            // with a keyless one (no primary key, or `REPLICA IDENTITY NOTHING`) would fail
+            // on every poll, permanently, for any pipeline with a transform configured.
             //
             // Key columns are a property of the table, so "this table's events resolve a
             // key" is the right granularity and needs no per-event identity.
@@ -571,11 +570,10 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_names_the_failing_transform_without_laundering_the_cause() {
-        // This test previously asserted that the pipeline re-wrapped every failure as
-        // `TransformError`. It did — and that flipped a `ConfigError` raised inside a
-        // transform from `ErrorKind::Configuration` to `ErrorKind::Terminal`, sending
-        // an embedder's error routing to the wrong branch. The transform name is still
-        // reported; the cause is now preserved alongside it.
+        // Re-wrapping every failure as `TransformError` would flip a `ConfigError` raised
+        // inside a transform from `ErrorKind::Configuration` to `ErrorKind::Terminal`,
+        // sending an embedder's error routing to the wrong branch. The transform name is
+        // reported and the cause preserved alongside it.
         let mut pipeline = TransformPipeline::default();
         pipeline.add_transform(Box::new(FailTransform));
 
@@ -645,10 +643,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_batch_mixing_keyed_and_keyless_tables_is_not_a_key_destruction() {
-        // The guard used to ask "did *any* event in the batch have a key, and does *any*
-        // event now lack one" — two different events. A keyless table (no primary key, or
-        // REPLICA IDENTITY NOTHING) travelling in the same batch as a keyed one therefore
-        // failed every poll, permanently, for any pipeline with a transform configured.
+        // "Did *any* event in the batch have a key, and does *any* event now lack one"
+        // asks about two different events: a keyless table (no primary key, or REPLICA
+        // IDENTITY NOTHING) travelling in the same batch as a keyed one would fail every
+        // poll, permanently, for any pipeline with a transform configured.
         let mut pipeline = TransformPipeline::default();
         pipeline.add_transform(Box::new(AppendSuffix));
 
@@ -684,9 +682,9 @@ mod tests {
     #[tokio::test]
     async fn declaring_the_events_keyless_is_allowed_in_both_paths() {
         // The error message tells the operator to clear `Event::primary_key` when the
-        // events are genuinely keyless. That remedy used to trip the very guard that
-        // recommended it, because "no key columns" and "key columns whose values are
-        // gone" were the same condition.
+        // events are genuinely keyless, so that remedy must not trip the guard that
+        // recommends it: "no key columns" and "key columns whose values are gone" are
+        // different conditions.
         let mut pipeline = TransformPipeline::default();
         pipeline.add_transform(Box::new(DeclareKeyless));
 

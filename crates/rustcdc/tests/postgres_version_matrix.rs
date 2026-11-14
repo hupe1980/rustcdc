@@ -43,6 +43,9 @@ async fn run_postgres_version_connection_test(
             "max_replication_slots=8",
             "-c",
             "max_wal_senders=8",
+            // The minimum, so a few thousand rows make the server stream a transaction.
+            "-c",
+            "logical_decoding_work_mem=64kB",
         ])
         .start()
         .await
@@ -96,26 +99,59 @@ async fn run_postgres_version_connection_test(
         conn_timeout_secs: 30,
         stream_poll_interval_ms: 50,
         max_events_per_poll: 1_000,
-        // This matrix checks connector behaviour across server *versions*; the containers run
-        // with `ssl = off` and present no certificate. It previously said `tls()` and connected
-        // anyway, because `sslmode=prefer` silently fell back to plaintext — so a line that read
-        // as TLS coverage was providing none. `sslmode=require` is now set whenever the transport
-        // is TLS, which makes that impossible; TLS itself is covered by the connection suites and
-        // by `wire::tests`.
+        // The containers run with `ssl = off`; a TLS transport would require TLS and be refused.
+        // TLS is covered by the connection suites and `wire::tests`.
         transport: TransportConfig::plaintext(),
         ..Default::default()
     };
 
-    let connection = PostgresConnection::new(config);
+    let mut connection = PostgresConnection::new(config);
     connection.connect().await?;
     assert_eq!(connection.source_type(), "postgres");
+
+    // Every supported release streams a large transaction before its commit (pgoutput v2),
+    // and rustcdc delivers it whole.
+    let mut stream = connection.start_stream(None).await?;
+    admin_client
+        .batch_execute(&format!(
+            "INSERT INTO public.{table_name} SELECT g, repeat('v', 200) FROM generate_series(1, 2000) g"
+        ))
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut rows = 0;
+    while rows < 2000 && std::time::Instant::now() < deadline {
+        rows += stream
+            .next_events(500)
+            .await?
+            .iter()
+            .filter(|event| !event.op.is_schema_change())
+            .count();
+    }
+    assert_eq!(
+        rows, 2000,
+        "{image_tag}: the streamed transaction arrived incomplete"
+    );
+    let streamed: i64 = admin_client
+        .query_one(
+            "SELECT stream_txns FROM pg_stat_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
+        .get(0);
+    assert!(
+        streamed > 0,
+        "{image_tag}: the server did not stream the transaction"
+    );
+    drop(stream);
     connection.close().await;
 
     Ok(())
 }
 
-/// Connect, replicate and close on every tested PostgreSQL version. A tag that no longer pulls
-/// fails: a retired image is the drift this matrix exists to catch.
+/// Connect, stream a large transaction, and close on every tested PostgreSQL version. A tag
+/// that no longer pulls fails: a retired image is the drift this matrix exists to catch.
 #[tokio::test]
 async fn postgres_connection_every_tested_version() -> rustcdc::Result<()> {
     if skip_postgres_version_matrix_case() {

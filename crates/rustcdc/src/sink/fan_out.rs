@@ -105,9 +105,9 @@ impl FanOutSinkAdapter {
     /// silently discards every event while reporting success on `send` and `flush` — the
     /// shape of a pipeline that looks healthy and delivers nothing.
     ///
-    /// This used to `assert!`, which is not an acceptable failure mode for a library: the
-    /// child list is frequently assembled from configuration, and an empty one is a
-    /// misconfiguration to report, not a reason to abort the embedder's process.
+    /// An error rather than a panic: the child list is frequently assembled from
+    /// configuration, and an empty one is a misconfiguration to report, not a reason to
+    /// abort the embedder's process.
     pub fn new(sinks: Vec<BoxedSink>) -> Result<Self> {
         if sinks.is_empty() {
             return Err(Error::ConfigError(

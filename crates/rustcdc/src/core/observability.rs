@@ -36,10 +36,9 @@ pub trait EventTracer: Send + Sync {
     ///
     /// Returning `false` lets the runtime skip work performed *solely* to feed the
     /// tracer. That work is not trivial: producing a trace id costs two `String`
-    /// allocations per event, and the commit path used to deep-clone every committed
-    /// event — both `serde_json::Value` trees — purely so it could hand them to
-    /// `trace_event_end`. With the default [`NoOpEventTracer`] every byte of that was
-    /// discarded, on the hottest path in the library.
+    /// allocations per event, and handing committed events to `trace_event_end` means
+    /// keeping both `serde_json::Value` trees alive. With the default [`NoOpEventTracer`]
+    /// every byte of that would be discarded, on the hottest path in the library.
     ///
     /// Defaults to `true`, so a tracer that does not override it keeps working
     /// unchanged.

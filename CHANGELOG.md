@@ -5,6 +5,123 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## 0.22.0
+
+Large PostgreSQL transactions stream while they run instead of spilling on the primary; a
+PostgreSQL snapshot stays at one point in time through a failed chunk; MariaDB 12.3 incremental
+snapshots work again; CI runs `effectively_once` end to end. **Breaking** for code that builds
+`PostgresSourceConfig` with a struct literal; see below.
+
+### Added: large PostgreSQL transactions stream while they run
+
+On PostgreSQL 14+ the connector negotiates pgoutput v2 with `streaming 'on'`. A transaction past
+`logical_decoding_work_mem` is sent while it runs instead of being spilled to the **primary's**
+disk until its commit. rustcdc holds it — in memory up to `stream_buffer_memory_bytes`, then in
+a spill file the OS deletes on close — and releases it at the commit, so a sink receives exactly what it
+received before. A rollback drops it; `ROLLBACK TO SAVEPOINT` drops that savepoint's rows. Debezium,
+Materialize, PeerDB, Supabase etl and Sequin all negotiate v1.
+
+- **Measured** (`cargo xtask pipeline-bench`, 300 000 updates held open 21 s, one machine): the
+  primary spilled 108 MB to its own disk under v1 and **0 MB** under v2, and the last row reached
+  Kafka **10.4 s** after the commit instead of 13.1 s. See [Performance](site/content/docs/performance.md).
+- **Default on.** `stream_in_progress_transactions = false` asks for v1. `sql_peek` always uses
+  v1: a peek can stop part-way through a stream and restart it on the next poll.
+- **Visible.** `/status` gains `source.open_transaction`, the console says *Reading a transaction
+  in progress — 2.1M changes so far*, and `rustcdc_streamed_transactions_open` and
+  `rustcdc_streamed_transaction_bytes{store}` are gauges. In the library:
+  `StreamHandle::streamed_transactions()` and `RuntimeAdminSnapshot::streamed_transactions`.
+- **Fails closed.** An unwritable `stream_spill_directory` stops the stream from opening; a full
+  disk stops the pipeline. A crash leaves no file behind, and the slot streams the transaction
+  again.
+- See [Large transactions](site/content/docs/connectors/postgres.md#large-transactions).
+- *Evidence*: the assembler's unit tests fail on a release at Stream Stop and on an ignored
+  savepoint abort. `postgres_streaming_integration` captures one workload — a savepoint rolled back
+  mid-stream, then a streamed transaction that aborts — through v2 and through `sql_peek`'s v1 and
+  requires the same events field by field, with the slots' statistics showing v2 streamed and v1
+  spilled; it fails with the savepoint abort planted out. Every supported PostgreSQL release
+  streams (`postgres_version_matrix`), and a crash mid-stream loses no committed row.
+
+### Fixed: incremental snapshots failed on MariaDB 12.3
+
+MariaDB 12.3 adds a fifth column to `SHOW MASTER STATUS`, `Gtid_Binlog_Pos`, where MySQL reports
+`Executed_Gtid_Set`. The connector read the watermark by position, so on 12.3 — once the server had
+written anything — it tried to parse MariaDB's GTID position (`0-1-3`) as a MySQL GTID set, and
+every incremental snapshot failed at its first watermark with *could not parse Executed_Gtid_Set*.
+Nothing wrong was written; nothing was snapshotted. The connector now reads `Executed_Gtid_Set` by
+name. MariaDB, which has no such value, uses the ordinal bracket on every release — the new column
+advances at the binlog flush, before the engine commit, so it cannot sharpen the bracket.
+[MySQL and MariaDB](site/content/docs/connectors/mysql.md) states the limit per engine.
+
+- *Evidence*: `mariadb_incremental_snapshot_reads_every_row_after_a_write` failed on the previous
+  tree with that error and passes; no suite ran a MariaDB incremental snapshot before it. MySQL 8.4 and 9.7
+  were checked live to name the column `Executed_Gtid_Set` in `SHOW BINARY LOG STATUS`; the MySQL
+  GTID watermark and snapshot suites pass unchanged.
+
+### Fixed: a PostgreSQL snapshot read a later point in time after a failed chunk
+
+A chunk that failed part-way rolled back the snapshot's transaction, and the next chunk opened a new
+one at a later point, so a row written between the failure and the reopen was read by the snapshot
+and delivered again by the stream. The snapshot now exports its point in time from a second
+connection that does nothing else, and every reader transaction — the first and any reopened —
+imports it. If that connection cannot open or is ended (`idle_in_transaction_session_timeout`), the
+snapshot continues as before and logs a WARN saying what that costs. The connector page also
+said an interrupted snapshot restarts from the beginning; it resumes at each table's cursor.
+
+- *Evidence*: the failed-chunk test inserts a row between the failure and the reopen; it was read
+  on the previous tree and is not now, and it is read again with the reopen's import planted out.
+
+### Fixed: a wrong PostgreSQL password was reported as "connection refused"
+
+When the host resolves to more than one address — `localhost` on current macOS resolves to
+`127.0.0.1` and `::1` — `tokio-postgres` tries each and reports the last error, so the server's
+refusal of the password (`28P01`) on the first was replaced by a refused connection on the second,
+and an operator debugged the network instead of the credentials. The connector now tries the
+addresses itself and reports the first server's answer. `check_is_primary` opens its connection
+through the same code, so it now rejects `allow_invalid_certificates` like the connection does
+instead of ignoring it.
+
+- *Evidence*: a unit test against a scripted server refusing the password on `127.0.0.1` with
+  nothing on `::1` gets `28P01`, and a connect error with the last-error behaviour planted back;
+  `postgres_connect_errors_carry_the_servers_sqlstate`, failing on a dual-stack host before, passes.
+
+### Added: CI runs the pipeline end to end under both contracts
+
+`cargo xtask pipeline-bench --smoke` runs PostgreSQL → the `rustcdc` binary → Apache Kafka under
+`at_least_once` and `effectively_once` and fails when a row never arrives or, under
+`effectively_once`, reaches the `read_committed` consumer twice — the bench's consumer now counts
+duplicates, which it could not see before. CI runs it on every pull request. It is the only job
+that composes the source, the delivery contract and a transactional sink.
+
+- *Evidence*: the smoke run fails with the 0.21 single-sink router defect planted back ("5000 of
+  5000 rows never reached the broker") and with a planted second send of each record ("5000 rows
+  reached the read_committed consumer more than once"); it passes in about two minutes locally.
+
+### Changed: the documentation site
+
+- **Console, Performance and Supported versions are in the docs menu.** They shipped unreachable
+  from it; the policy gate now fails when a page is missing from the menu or a menu entry has no
+  page.
+- **Screenshots open full size** on click, in the theme the page is showing, and follow the site's
+  theme toggle rather than only the operating system's.
+- The README shows the console.
+
+### Breaking and upgrading
+
+- **`PostgresSourceConfig` has three new public fields.** A struct literal needs
+  `..PostgresSourceConfig::default()`; `RuntimeAdminSnapshot` has one more field.
+- **Streaming is on by default** on PostgreSQL 14+ over the streaming transport. Its spill
+  directory, the system temporary directory unless `stream_spill_directory` says otherwise, must be
+  writable or the stream does not open; under a read-only root filesystem mount an `emptyDir` there,
+  or set `stream_in_progress_transactions = false`.
+- **A snapshot holds one more connection** while it runs. Leave `idle_in_transaction_session_timeout`
+  unset for the CDC role, or the snapshot falls back to a later point after a failed chunk.
+- **`check_is_primary` rejects `allow_invalid_certificates`**, as connecting already did.
+
+### Evidence
+
+Library 1 291 and server 596 unit tests, the gate, the doc tests and every PostgreSQL, MariaDB
+(12.3 and 10.11) and MySQL container suite pass; each fix above names the test that fails without it.
+
 ## 0.21.0
 
 An operator console, a pipeline five times faster on large transactions, `effectively_once` working

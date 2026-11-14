@@ -30,11 +30,10 @@ impl CdcRuntime {
         }
 
         if self.config.options.schema_history_retention.is_none() {
-            // Warn rather than refuse to start. Schema history now grows only in
-            // response to actual DDL on captured tables, which is rare in most
-            // deployments — refusing to start over an unbounded-growth risk that may
-            // never materialize is disproportionate, and it previously forced every
-            // operator to configure retention for a subsystem nothing populated.
+            // Warn rather than refuse to start. Schema history grows only in response to
+            // actual DDL on captured tables, which is rare in most deployments — refusing
+            // to start over an unbounded-growth risk that may never materialize is
+            // disproportionate.
             tracing::warn!(
                 target: "rustcdc::core::runtime",
                 "no schema_history_retention policy configured; schema history will grow \

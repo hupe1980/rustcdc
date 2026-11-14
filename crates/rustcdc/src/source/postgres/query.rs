@@ -33,27 +33,6 @@ impl ReconcileOps for Client {
     }
 }
 
-/// Primary-key columns of every table in `publication`, keyed by `(schema, table)`.
-///
-/// # Why the stream needs this at all
-///
-/// pgoutput's RELATION message flags each column with `LOGICALREP_IS_REPLICA_IDENTITY`, and that
-/// flag is **not** "part of the primary key". PostgreSQL sets it on *every* column of a table with
-/// `REPLICA IDENTITY FULL` — its own source says so: "REPLICA IDENTITY FULL means all columns are
-/// sent as part of key." Reading the flag as a primary key therefore reports the whole row as the
-/// key for such a table, which:
-///
-/// * makes the key change whenever **any** column changes, so a log-compacted topic can never
-///   collapse a row's history and per-key routing sends one row's versions to several partitions;
-/// * disagrees with the snapshot path, which reads the real key from this catalog — so the same
-///   row is keyed one way while being snapshotted and another way while being streamed, defeating
-///   the handoff's deduplication and the idempotency digest;
-/// * turns an unchanged-TOAST update into no write at all, because one of the "key" columns is
-///   unavailable and a partial key must be refused rather than widened.
-///
-/// The flag is right for `DEFAULT` and `INDEX` identities, where it names the primary key or the
-/// nominated index. Only `FULL` needs this lookup, and only the catalog can answer it.
-///
 /// Read every published table's declared column types and nullability, once per stream start.
 ///
 /// # Why `format_type` and not the pgoutput type OID
@@ -62,14 +41,13 @@ impl ReconcileOps for Client {
 /// the OID through a built-in table loses two things and misreports a third:
 ///
 /// * **The modifier.** `numeric(12,4)`, `character varying(64)` and `timestamp(3)` all
-///   arrive as `numeric`, `varchar` and `timestamp`. The modifier *is* decoded from the
-///   wire and was never read, so an `ALTER COLUMN amount TYPE numeric(14,4)` produced a
-///   schema-change event whose payload was byte-identical to the previous one — an event
-///   announcing a change it could not describe.
+///   arrive as `numeric`, `varchar` and `timestamp`, so an `ALTER COLUMN amount TYPE
+///   numeric(14,4)` would produce a schema-change event byte-identical to the previous
+///   one — an event announcing a change it cannot describe.
 /// * **Every type that is not built in.** Enums, domains, ranges, `hstore` and PostGIS
-///   types have installation-specific OIDs, so they degraded to `pg_type_oid:<N>`.
-/// * **Nullability**, which pgoutput does not carry at all. It was inferred from the
-///   primary key, which marks every `NOT NULL` non-key column nullable.
+///   types have installation-specific OIDs, so they degrade to `pg_type_oid:<N>`.
+/// * **Nullability**, which pgoutput does not carry at all. Inferring it from the primary
+///   key marks every `NOT NULL` non-key column nullable.
 ///
 /// `pg_catalog.format_type(atttypid, atttypmod)` is the function PostgreSQL's own
 /// `\d` uses. It answers all three, in the server's own syntax, for every type the server
@@ -192,6 +170,27 @@ pub(super) async fn query_table_column_types(
         .collect())
 }
 
+/// Primary-key columns of every table in `publication`, keyed by `(schema, table)`.
+///
+/// # Why the stream needs this at all
+///
+/// pgoutput's RELATION message flags each column with `LOGICALREP_IS_REPLICA_IDENTITY`, and that
+/// flag is **not** "part of the primary key". PostgreSQL sets it on *every* column of a table with
+/// `REPLICA IDENTITY FULL` — its own source says so: "REPLICA IDENTITY FULL means all columns are
+/// sent as part of key." Reading the flag as a primary key therefore reports the whole row as the
+/// key for such a table, which:
+///
+/// * makes the key change whenever **any** column changes, so a log-compacted topic can never
+///   collapse a row's history and per-key routing sends one row's versions to several partitions;
+/// * disagrees with the snapshot path, which reads the real key from this catalog — so the same
+///   row is keyed one way while being snapshotted and another way while being streamed, defeating
+///   the handoff's deduplication and the idempotency digest;
+/// * turns an unchanged-TOAST update into no write at all, because one of the "key" columns is
+///   unavailable and a partial key must be refused rather than widened.
+///
+/// The flag is right for `DEFAULT` and `INDEX` identities, where it names the primary key or the
+/// nominated index. Only `FULL` needs this lookup, and only the catalog can answer it.
+///
 /// Ordering matters: a composite key is returned in index order, matching
 /// [`query_primary_key_columns_and_types`] so the two paths produce identical keys.
 pub(super) async fn query_publication_primary_keys(

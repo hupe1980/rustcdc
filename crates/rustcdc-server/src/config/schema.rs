@@ -177,7 +177,7 @@ impl IncrementalSnapshotConfig {
             // supported way to scope a backfill requested later, and rejecting it would
             // refuse a working configuration.
             //
-            // The typo case it was really guarding is caught where it can be caught
+            // The typo case is caught where it can be caught
             // precisely: a `conditions` entry in an `execute_snapshot` request must name a
             // table in that request's own `tables` list. There the two lists arrive
             // together, so a mismatch is unambiguous.
@@ -192,15 +192,10 @@ impl AppConfig {
 
 /// End-to-end delivery guarantee requested by the operator.
 ///
-/// `at_most_once` **was removed.** It was accepted, labelled and validated but never
-/// acted on: the code that would have advanced the checkpoint before delivery was
-/// defined and never called, so every deployment that selected it silently received
-/// at-least-once — the opposite of the decision the operator had made.
-///
-/// It was removed rather than implemented because it cannot be given a meaningful
-/// definition on this pipeline: delivery is batched, so advancing the checkpoint before
-/// a batch skips an *arbitrary suffix* of that batch on failure, not one event. A
-/// contract whose loss boundary an operator cannot predict is not a contract. Use
+/// There is no `at_most_once`: it cannot be given a meaningful definition on this
+/// pipeline. Delivery is batched, so advancing the checkpoint before a batch skips an
+/// *arbitrary suffix* of that batch on failure, not one event. A contract whose loss
+/// boundary an operator cannot predict is not a contract. Use
 /// `at_least_once` and deduplicate in the sink on a key you control.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -246,7 +241,7 @@ impl DeliveryContract {
     /// Snowflake sink both answer "idempotent delivery: yes, transactional barrier: no" —
     /// identical answers, opposite verdicts. Snowflake reaches the contract through a
     /// destination-side offset token, which is what
-    /// [`SinkDeliveryGuarantee::EffectivelyOnce`] records; an idempotent Kafka producer
+    /// [`rustcdc::SinkDeliveryGuarantee::EffectivelyOnce`] records; an idempotent Kafka producer
     /// does not, and reports `AtLeastOnceIdempotent`.
     ///
     /// Requiring both booleans therefore rejected the documented Snowflake path outright,
@@ -552,12 +547,10 @@ pub struct ObservabilityConfig {
     /// names, column names and source offsets, so an unencrypted export to a remote
     /// collector is an information disclosure over the wire.
     ///
-    /// This was the bare environment variable `OTLP_ALLOW_INSECURE=1`, read inside the
-    /// telemetry validator and declared nowhere. A security-relevant override that lives
-    /// outside the configuration file is invisible to `validate-config`, absent from
+    /// A field rather than an environment variable: a security-relevant override that
+    /// lives outside the configuration file is invisible to `validate-config`, absent from
     /// `GET /config`, unreachable by the inert-settings scanner, and cannot be reviewed
-    /// alongside the settings it overrides. Every other switch in this server is a field;
-    /// so is this one.
+    /// alongside the settings it overrides.
     #[serde(default)]
     pub otlp_allow_insecure: bool,
 }
@@ -1189,7 +1182,7 @@ mod tests {
     }
 
     /// A derived `Default` ignores `#[serde(default = "bool_true")]`, so omitting the
-    /// whole `[sink.kafka.security]` table used to disable certificate verification.
+    /// whole `[sink.kafka.security]` table must not disable certificate verification.
     #[test]
     fn security_default_verifies_peer_certificates() {
         assert!(KafkaSecurityConfig::default().verify_peer);
@@ -1451,8 +1444,7 @@ mod tests {
     // ─── Kafka producer tuning ───────────────────────────────────────────────
 
     /// The transactional builder reaches `compression_level` too, so exactly-once costs
-    /// no tuning knob. Pinned because this sink used to reject the pairing rather than
-    /// accept a setting the builder would silently discard.
+    /// no tuning knob.
     #[test]
     fn compression_level_is_accepted_for_transactional_delivery() {
         let mut cfg = sample_kafka_config("kafka:9092");

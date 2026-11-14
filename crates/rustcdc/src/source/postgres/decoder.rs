@@ -264,11 +264,9 @@ pub(super) fn decode_pgoutput_message(data: &[u8]) -> Result<PgOutputMessage> {
 /// | length | `Int32` | content length |
 /// | content | `Byten` | opaque application bytes |
 ///
-/// **There is no transaction id here**, and that is a protocol-version property rather
-/// than an omission: pgoutput prefixes an `Xid` only for messages belonging to a *streamed*
-/// transaction, which exists from `proto_version '2'`. This decoder negotiates v1 and
-/// rejects v2 framing outright, so reading an `Xid` would consume the flags byte and
-/// misparse every field after it.
+/// **There is no transaction id here.** pgoutput prefixes an `Xid` only inside a v2 stream
+/// block, and the streaming transport strips it before a message reaches this decoder, so
+/// reading one would consume the flags byte and misparse every field after it.
 ///
 /// The length is checked against what the frame actually holds before allocating: a
 /// declared length is attacker-influenced in the sense that matters here — it comes off the
@@ -610,6 +608,11 @@ pub(super) trait PgOutputMessageProvider: Send + Sync {
     async fn sample_slot_state(&mut self) -> Result<Option<super::parser::SlotState>> {
         Ok(None)
     }
+
+    /// Transactions held before their commit; `None` unless v2 streaming was negotiated.
+    fn streamed_transactions(&self) -> Option<crate::core::StreamedTransactions> {
+        None
+    }
 }
 
 pub(super) struct LivePgOutputMessageProvider {
@@ -647,6 +650,10 @@ impl PgOutputMessageProvider for LivePgOutputMessageProvider {
             .query(
                 // The options array is built rather than interpolated: it is a `text[]`
                 // parameter, so `messages` is added as data instead of as SQL.
+                //
+                // Always v1: `upto_nchanges` is checked per WAL record and every peek restarts
+                // at the confirmed position, so a v2 stream longer than one peek would be cut
+                // at the same place on every poll and never reach its commit.
                 if self.capture_logical_messages {
                     "SELECT lsn::text, data FROM pg_logical_slot_peek_binary_changes($1, NULL, \
                      $2, 'proto_version', '1', 'publication_names', $3, 'messages', 'true')"

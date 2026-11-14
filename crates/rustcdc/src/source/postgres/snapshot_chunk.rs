@@ -60,22 +60,9 @@ pub(super) async fn next_postgres_snapshot_chunk(
             )
         };
 
-        // Emit the same identity the streaming path emits.
-        //
-        // Snapshot events previously carried `schema: None` and `primary_key: None`
-        // while streaming populated both, so for one physical table the two phases
-        // disagreed on both the event key and the routing name:
-        //
-        //   * `Event::primary_key_values()` returned `None`, so `encode_key` produced
-        //     an unkeyed record for **every row of the initial load**. Log compaction
-        //     never collapses those rows, upsert consumers cannot correlate them with
-        //     later updates, and the pre-snapshot value resurfaces after compaction.
-        //   * `qualified_table_name()` yielded `"users"` during snapshot but
-        //     `"public.users"` during streaming, so a router configured for
-        //     `public.users` silently received zero snapshot rows.
-        //
-        // MySQL and SQL Server already set the primary key on snapshot rows;
-        // PostgreSQL was the outlier, and `postgres` is the default feature.
+        // The same identity the streaming path emits: without the key a snapshot row is an
+        // unkeyed record that compaction and upserts cannot correlate with later updates, and
+        // without the schema a router for `public.users` receives no snapshot rows.
         let (schema_name, bare_table) = split_qualified_table_name(&table_name);
         let primary_key = if key_columns.is_empty() {
             None
@@ -291,28 +278,19 @@ async fn abandon_aborted_snapshot_transaction(handle: &mut PostgresSnapshotHandl
     }
 }
 
-/// Reopen the snapshot transaction a failed chunk rolled back.
+/// Reopen the snapshot transaction a failed chunk rolled back, on the original snapshot.
 ///
-/// The new transaction reads at a later point than the one it replaces, and that is the
-/// guarantee a snapshot resumed from a checkpoint already gives: rows past the keyset cursor
-/// are read as they are now, and anything that changed after the original watermark reaches
-/// the consumer through the stream, which starts from that watermark. The watermark is kept.
+/// The anchor keeps the exported snapshot alive, so the reopened transaction reads the same point
+/// in time as the one it replaces. Without the anchor it reads a later point; anything that
+/// changed after the watermark still reaches the consumer through the stream, which starts there.
 async fn reopen_snapshot_transaction_if_aborted(handle: &mut PostgresSnapshotHandle) -> Result<()> {
-    let Some(client) = handle.client.as_ref() else {
+    let Some(client) = handle.client.clone() else {
         return Ok(());
     };
     if handle.transaction_open {
         return Ok(());
     }
-    client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .await
-        .map_err(super::pg_error::PgError::from)
-        .map_err(|error| {
-            Error::SourceError(format!(
-                "failed to reopen postgres snapshot transaction after a failed chunk: {error}"
-            ))
-        })?;
+    super::snapshot_start::begin_snapshot_transaction(&client, &mut handle.anchor).await?;
     handle.transaction_open = true;
     Ok(())
 }

@@ -429,8 +429,7 @@ async fn preflight_checks_the_schemas_of_the_configured_format() -> rustcdc::Res
         SchemaRegistryConfig::new(&ccompat, "cdc.pf.proto").with_auto_register(false);
     preflight_schema_registry(proto_registry.as_ref(), &strict_proto, SchemaType::Protobuf).await?;
 
-    // The old behaviour, made explicit: asking for Avro against a JSON-only topic must
-    // fail, which is precisely what a JSON pipeline used to get unconditionally.
+    // Asking for Avro against a JSON-only topic must fail.
     assert!(
         preflight_schema_registry(json_registry.as_ref(), &strict_json, SchemaType::Avro)
             .await

@@ -283,10 +283,10 @@ pub struct SqlServerStream {
     /// It cannot be written straight to [`Self::cursor`]: `save_position` persists
     /// `cursor` when it is set, and doing so while events from this window are still
     /// sitting in `window_buffer` would make a position durable ahead of rows the
-    /// consumer has not seen. It also cannot be dropped, which is what used to
-    /// happen — it was a local variable, so a multi-page window forgot that some
-    /// capture instance had unread rows and the deferred `advance_window()` skipped
-    /// them permanently and silently. Parking it here and applying it at the drain
+    /// consumer has not seen. It also cannot be dropped: a multi-page window would
+    /// forget that some capture instance has unread rows and the deferred
+    /// `advance_window()` would skip them permanently and silently. Parking it here and
+    /// applying it at the drain
     /// point satisfies both constraints.
     pub(crate) pending_cursor: Option<parser::SqlServerCdcCursor>,
 }
@@ -1066,10 +1066,10 @@ impl StreamHandle for SqlServerStreamHandle {
 
                 // Park the truncation cursor — possibly `None`, which is equally
                 // load-bearing — so the drain point can settle the window whether that
-                // happens now or several polls from now. It used to be a local variable,
-                // read only on the single-page path; a multi-page window therefore forgot
-                // that a capture instance still had unread rows, and the deferred
-                // `advance_window()` stepped over them permanently and without a signal.
+                // happens now or several polls from now. As a local variable it would be
+                // read only on the single-page path, so a multi-page window would forget
+                // that a capture instance still has unread rows, and the deferred
+                // `advance_window()` would step over them permanently and without a signal.
                 self.stream.pending_cursor = truncation_cursor;
 
                 let count = self.max_events_per_poll.min(self.window_buffer.len());
@@ -2198,13 +2198,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_truncated_window_survives_a_multi_page_drain_instead_of_being_advanced_past() {
-        // Regression: the truncation cursor used to be a local variable in the fill
-        // path, applied only when the buffer happened to drain in the same poll. With
-        // two or more capture instances a window routinely yields more events than one
-        // poll returns, so the buffer did *not* drain there — the cursor was dropped and
-        // the deferred `advance_window()` at the drain point moved past the unread
-        // remainder of the truncated instance. Those rows were gone, permanently, with
-        // `events_polled` still reporting a plausible count.
+        // With two or more capture instances a window routinely yields more events than
+        // one poll returns, so the buffer does *not* drain in the poll that filled it. A
+        // truncation cursor held only in the fill path would be dropped, and the deferred
+        // `advance_window()` at the drain point would move past the unread remainder of
+        // the truncated instance — permanently, with `events_polled` still plausible.
         //
         // Parking it on the stream is what makes the two poll paths agree. This asserts
         // the drain-point decision directly; `tests/sqlserver_stream_integration.rs`

@@ -36,6 +36,7 @@ postgres = [
     "dep:hmac",
     "dep:base64",
     "dep:md-5",
+    "dep:tempfile",
     "tls",
 ]
 # Enable MySQL-specific source implementations.
@@ -102,6 +103,8 @@ apicurio = ["schemreg", "schemreg/apicurio"]
 glue = ["schemreg", "schemreg/glue"]
 
 [dependencies]
+# Spill files for streamed PostgreSQL transactions, deleted by the OS on close, so a crash leaves none.
+tempfile = { version = "3.23.0", optional = true }
 # 0.1.92 minimum: 0.1.91 and earlier push `#[must_use]` onto every generated method, which
 # nightly clippy now rejects as `double_must_use` on the boxed-future return type.
 async-trait = "0.1.92"

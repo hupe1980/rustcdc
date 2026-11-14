@@ -42,6 +42,20 @@ cargo add rustcdc --features postgres
 
 The Homebrew formula installs the release binary built with every connector and sink.
 
+The server's [console](https://hupe1980.github.io/rustcdc/docs/console/) at `/ui` answers *is it
+working, and if not, who can fix it?* in one sentence:
+
+<p>
+<a href="site/static/console/health-light.webp"><picture>
+  <source srcset="site/static/console/health-dark.webp" media="(prefers-color-scheme: dark)">
+  <img src="site/static/console/health-light.webp" alt="Health: the pipeline is capturing; the source → rustcdc → destination strip, throughput and the last batch" width="49%">
+</picture></a>
+<a href="site/static/console/stalled-health-light.webp"><picture>
+  <source srcset="site/static/console/stalled-health-dark.webp" media="(prefers-color-scheme: dark)">
+  <img src="site/static/console/stalled-health-light.webp" alt="A stall: the destination keeps refusing a batch, its hop is lit, and restarting will not help" width="49%">
+</picture></a>
+</p>
+
 ## Repository layout
 
 | Path | What it is |

@@ -425,11 +425,10 @@ impl HttpSink {
                 Ok(status) if Self::is_retryable_status(status) => {
                     // Classified on **every** observation, including the last one.
                     //
-                    // This used to sit inside the `attempt < max_retries` branch, so the
-                    // attempt that actually failed the batch — the single most useful one
-                    // to an operator — was never counted. `retryable_status_5xx_total`
-                    // undercounted by one per exhausted batch, and with `max_retries = 0`
-                    // it stayed at zero no matter how many 503s the endpoint returned.
+                    // Inside the `attempt < max_retries` branch, the attempt that actually
+                    // fails the batch — the most useful one to an operator — would never be
+                    // counted, and with `max_retries = 0` `retryable_status_5xx_total`
+                    // would stay at zero no matter how many 503s the endpoint returned.
                     self.classify_status(status, DeliveryPhase::Retryable);
                     if attempt < self.max_retries {
                         self.accounting.retried += 1;

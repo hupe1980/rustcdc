@@ -708,12 +708,10 @@ read_token_env = "CDC_TEST_STATUS_READ_TOKEN"
     )
     .expect("write config");
 
-    // **The token is the point.** This probe used to be unauthenticated, on the reasoning
-    // that a loopback bind with no tokens leaves `/status` open. It does not — read scope
-    // fails closed when no read token is configured — so the response was the four-byte
-    // string `unauthorized`, and "no secret appears in the body" held trivially. The test
-    // named after redaction never exercised redaction once. The legibility assertion below
-    // is what exposed that, and is why it is here rather than being merely nice to have.
+    // **The token is the point.** Read scope fails closed when no read token is
+    // configured, so an unauthenticated probe gets the string `unauthorized`, and "no
+    // secret appears in the body" would hold trivially. The legibility assertion below
+    // catches that.
     let _env = rustcdc_server::test_env::EnvGuard::set(&[(
         "CDC_TEST_STATUS_READ_TOKEN",
         "status-read-token",

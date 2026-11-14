@@ -53,9 +53,9 @@ struct RemoteCheckpointRecord {
 pub(crate) struct OpenDalCheckpoint {
     /// Held directly rather than behind a mutex.
     ///
-    /// `Operator` is `Clone + Send + Sync` and does its own connection pooling, so the
-    /// `Arc<Mutex<_>>` this used to carry only serialised the durability path — and it
-    /// would have serialised the lease heartbeat against it too.
+    /// `Operator` is `Clone + Send + Sync` and does its own connection pooling, so an
+    /// `Arc<Mutex<_>>` would only serialise the durability path, and the lease heartbeat
+    /// against it.
     op: Operator,
     mirror: FileCheckpoint,
     /// This process's lease identity, re-verified before every checkpoint write.
@@ -466,9 +466,8 @@ mod tests {
     /// strictly worse than forgetting progress, because the resume point ends up behind
     /// data the sink already committed while the counters still report health.
     ///
-    /// This backend used to write the remote store *first* and rely on the mirror to
-    /// validate second, so the refused record was already durable by the time the error
-    /// surfaced, and the next startup restored the mirror from it. Deleting the
+    /// Validating after the remote write would make the refused record durable before the
+    /// error surfaced, and the next startup would restore the mirror from it. Deleting the
     /// `validate_checkpoint_progress` call in `save` — or moving it below the remote
     /// write — fails this test on the final assertion, which is what makes it evidence
     /// rather than decoration.

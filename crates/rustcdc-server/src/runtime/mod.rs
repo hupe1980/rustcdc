@@ -1,31 +1,16 @@
-//! The capture pipeline's engine: poll a batch, transform it, deliver it, checkpoint it.
+//! The capture pipeline's engine: poll a batch, transform it, deliver it, checkpoint it. These
+//! modules are what `rustcdc run`, `dry-run` and `replay` start; they are not commands.
 //!
-//! # Why this is not in `commands/`
-//!
-//! These eight modules lived in `src/commands/` under `run_*` names, alongside the ten CLI
-//! entry points. They are not commands. `rustcdc run` is a command; the select loop, the
-//! prepare/deliver pipeline, the metrics accumulator, the recovery state machine and the
-//! checkpoint-transaction reconciler are the machine that command starts, and they are also
-//! reached by `dry-run` and `replay`.
-//!
-//! Nineteen files in `commands/`, of which eight were engine internals, made the directory
-//! unreadable as a list of what the binary can do. Worse, the flat `run_` prefix produced
-//! three names that cannot be told apart — `run_batch`, `run_loop`, `run_loop_batch` — for
-//! three genuinely different things.
-//!
-//! The split *itself* was never gratuitous: combined these are ~5 700 lines, well past the
-//! 3 700-line budget `tests/architecture.rs` enforces, and `metrics.rs` alone is 2 900. What
-//! was wrong was the location and the naming, so both changed:
-//!
-//! | was | is | what it actually does |
-//! |---|---|---|
-//! | `run_loop.rs` | [`event_loop`] | the `select!` over shutdown, admin exit and `poll_event_batch` |
-//! | `run_loop_batch.rs` | [`batch_commit`] | one polled batch: barrier, retry policy, checkpoint, commit |
-//! | `run_batch.rs` | [`batch`] | the prepare/deliver pipeline *within* a batch |
-//! | `run_metrics.rs` | [`metrics`] | the accumulator and the Prometheus render |
-//! | `run_recovery.rs` | [`recovery`] | backoff and the circuit breaker |
-//! | `run_reconciliation.rs` | [`reconciliation`] | the checkpoint-transaction marker |
-//! | `run_lifecycle.rs` | [`lifecycle`] | terminal outcomes and shutdown finalisation |
+//! | module | what it does |
+//! |---|---|
+//! | `event_loop` | the `select!` over shutdown, admin exit and `poll_event_batch` |
+//! | `batch_commit` | one polled batch: barrier, retry policy, checkpoint, commit |
+//! | `batch` | the prepare/deliver pipeline *within* a batch |
+//! | `metrics` | the accumulator and the Prometheus render |
+//! | `recovery` | backoff and the circuit breaker |
+//! | `reconciliation` | the checkpoint-transaction marker |
+//! | `lifecycle` | terminal outcomes and shutdown finalisation |
+//! | `park` | holding a pipeline whose source position is lost |
 
 /// Batch prepare-and-deliver, `pub` so `benches/throughput.rs` can measure the real thing.
 ///

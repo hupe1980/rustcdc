@@ -278,6 +278,16 @@
       </article>
 
       <article class="feature">
+        <h3>Large transactions, streamed</h3>
+        <p>
+          On PostgreSQL 14+ a large transaction streams while it runs instead of spilling to the
+          primary's disk. rustcdc holds it in bounded memory, then a spill file, and releases it
+          only at the commit: a rollback reaches no sink.
+        </p>
+        <a href="{{ get_url(path='/docs/connectors/postgres/') }}#large-transactions">Large transactions →</a>
+      </article>
+
+      <article class="feature">
         <h3>A console that names the owner</h3>
         <p>
           The server serves an operator console at <code>/ui</code>. When the pipeline stalls,
@@ -300,7 +310,7 @@
       <article class="feature">
         <h3>Throughput you can reproduce</h3>
         <p>
-          About 23 000 rows/s from PostgreSQL through the release binary to Kafka, under either
+          17 000–27 000 rows/s from PostgreSQL through the release binary to Kafka, under either
           delivery contract, with default settings on one laptop. One table and one partition;
           <code>cargo xtask pipeline-bench</code> measures it on your machine.
         </p>

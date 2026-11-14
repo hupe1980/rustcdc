@@ -509,9 +509,7 @@ async fn connect_runs_one_statement_so_a_broken_transport_fails_at_startup() {
 async fn save_position_reports_a_monotonic_committed_count() {
     // `FileCheckpoint` refuses a write whose committed-event count moves backwards. A
     // handle that reported zero here would fail on shutdown for any stream that had
-    // already committed something, turning an orderly stop into a checkpoint error —
-    // which is how this was caught, by comparing against what every other connector
-    // passes rather than by the tests above, all of which passed.
+    // already committed something, turning an orderly stop into a checkpoint error.
     use crate::checkpoint::{Checkpoint, InMemoryCheckpoint};
 
     let executor = ScriptedExecutor::new(
@@ -589,7 +587,7 @@ async fn the_event_timestamp_is_the_window_bound_not_the_decode_time() {
 #[tokio::test]
 async fn the_final_snapshot_chunk_is_marked_as_last() {
     // A consumer materialising a snapshot into a staging table watches `is_last_chunk` to
-    // know when to swap it in. It was never set, so that consumer waited forever.
+    // know when to swap it in; unset, that consumer waits forever.
     let executor = ScriptedExecutor::new(
         vec![5_000],
         vec![

@@ -531,9 +531,8 @@ fn delivered_ids(output_path: &Path) -> Vec<u64> {
 
 /// **A transient sink failure must be retried, not fatal.**
 ///
-/// A sink send timeout used to terminate the process: the batch path returned a
-/// terminal outcome without ever consulting the recovery policy that the *source* path
-/// has always used. A few-second broker leader election therefore became a process
+/// The batch path consults the same recovery policy as the *source* path. Treating a sink
+/// send timeout as terminal would turn a few-second broker leader election into a process
 /// exit, a restart and a full replay from the last checkpoint.
 ///
 /// The sink is an HTTP endpoint on a closed loopback port, so every send fails with a
@@ -987,11 +986,10 @@ async fn a_clean_batch_boundary_replays_nothing_on_restart() {
 ///
 /// # What this does *not* pin
 ///
-/// This test previously carried a docstring claiming it was the tripwire for the
-/// `effectively_once` crash window — that closing the window "**must fail** this test".
-/// It could not. The harness uses a `file_jsonl` sink, which has no transactional barrier
-/// and no `effectively_once` guarantee of any kind, so the window it reproduces is the
-/// inherent `at_least_once` one, which will never close.
+/// This is not a tripwire for the `effectively_once` crash window. The harness uses a
+/// `file_jsonl` sink, which has no transactional barrier and no `effectively_once`
+/// guarantee of any kind, so the window it reproduces is the inherent `at_least_once` one,
+/// which will never close.
 ///
 /// The genuine `effectively_once` window — the sink transaction commits, then the
 /// checkpoint is written outside it — therefore has **no** regression tripwire. Closing it

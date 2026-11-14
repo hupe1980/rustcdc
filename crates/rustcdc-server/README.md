@@ -15,6 +15,11 @@ with configurable delivery semantics, a pluggable WASM transform pipeline, and a
 
 </div>
 
+<a href="../../site/static/console/health-light.webp"><picture>
+  <source srcset="../../site/static/console/health-dark.webp" media="(prefers-color-scheme: dark)">
+  <img src="../../site/static/console/health-light.webp" alt="The operator console at /ui: one sentence on whether the pipeline is working, and who can fix it when it is not" width="100%">
+</picture></a>
+
 ---
 
 > [!NOTE]
@@ -462,7 +467,7 @@ rustcdc snapshot public.invoices --admin-write-token-env RUSTCDC_WRITE_TOKEN
 docker pull ghcr.io/hupe1980/rustcdc-server:latest
 
 # Pin to a specific version
-docker pull ghcr.io/hupe1980/rustcdc-server:0.21.0
+docker pull ghcr.io/hupe1980/rustcdc-server:0.22.0
 ```
 
 Images are built on distroless/cc (no shell, no package manager), signed with SLSA provenance, and include a software bill of materials (SBOM). [See the Dockerfile](../../Dockerfile) for build details.

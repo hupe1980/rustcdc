@@ -149,6 +149,29 @@ pub(in crate::source::postgres) struct ReplicationParams<'a> {
     pub(in crate::source::postgres) connect_timeout: Duration,
     /// Request `messages 'true'`, so the server sends `pg_logical_emit_message()` output.
     pub(in crate::source::postgres) capture_logical_messages: bool,
+    /// Ask for pgoutput v2 with `streaming 'on'` when the server supports it (14+).
+    pub(in crate::source::postgres) stream_in_progress: bool,
+}
+
+/// The pgoutput protocol a stream negotiated, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::source::postgres) enum PgOutputProtocol {
+    /// v2 with `streaming 'on'`: large in-progress transactions arrive in stream blocks.
+    StreamingV2,
+    /// v1, because streaming was turned off.
+    V1Disabled,
+    /// v1, because the server is older than 14 or did not report its version.
+    V1Server(Option<u32>),
+}
+
+impl PgOutputProtocol {
+    fn choose(stream_in_progress: bool, server_major: Option<u32>) -> Self {
+        match (stream_in_progress, server_major) {
+            (false, _) => Self::V1Disabled,
+            (true, Some(major)) if major >= 14 => Self::StreamingV2,
+            (true, other) => Self::V1Server(other),
+        }
+    }
 }
 
 /// Why a replication stream could not be opened.
@@ -206,6 +229,9 @@ pub(in crate::source::postgres) struct ReplicationStream {
     /// Must stay comfortably below the server's `wal_sender_timeout` (default 60 s), or the
     /// server concludes the client is gone and drops the connection mid-stream.
     status_interval: Duration,
+    /// The major version from the startup `server_version` parameter.
+    server_major: Option<u32>,
+    protocol: PgOutputProtocol,
 }
 
 impl ReplicationStream {
@@ -252,6 +278,8 @@ impl ReplicationStream {
             // A tenth of the 60 s default `wal_sender_timeout`, so several updates are
             // missed before the server gives up on us.
             status_interval: Duration::from_secs(6),
+            server_major: None,
+            protocol: PgOutputProtocol::V1Disabled,
         };
 
         stream.startup(params.user, params.database).await?;
@@ -259,6 +287,7 @@ impl ReplicationStream {
             .authenticate(params.user, params.password, params.transport)
             .await?;
         stream.await_ready().await?;
+        stream.protocol = PgOutputProtocol::choose(params.stream_in_progress, stream.server_major);
         stream
             .start_replication(
                 params.slot_name,
@@ -479,8 +508,14 @@ impl ReplicationStream {
             let message = self.read_backend_message().await?;
             match message.tag {
                 tag::READY_FOR_QUERY => return Ok(()),
-                // Parameter statuses and the cancellation key are informational here.
-                tag::PARAMETER_STATUS | tag::BACKEND_KEY_DATA => {}
+                tag::PARAMETER_STATUS => {
+                    let mut fields = message.payload.split(|byte| *byte == 0);
+                    if fields.next() == Some(b"server_version".as_slice()) {
+                        self.server_major = fields.next().and_then(parse_server_major);
+                    }
+                }
+                // The cancellation key is informational here.
+                tag::BACKEND_KEY_DATA => {}
                 other => {
                     return Err(Error::SourceError(format!(
                         "unexpected message tag {} while waiting for postgres to become \
@@ -506,9 +541,10 @@ impl ReplicationStream {
 
         // `0/0` asks the server to resume from the slot's own confirmed_flush_lsn.
         let start = format!("{:X}/{:X}", start_lsn >> 32, start_lsn & 0xFFFF_FFFF);
-        // `proto_version '1'` is what this crate's pgoutput decoder implements. Requesting
-        // a higher version would make the server send v2 streaming and v3 two-phase
-        // messages the decoder deliberately rejects rather than silently mishandles.
+        // v2 with `streaming 'on'` has the server send a large transaction while it runs;
+        // the provider holds it until `Stream Commit`, so the decoder still sees v1. Never v3
+        // or v4: two-phase and parallel apply have nothing to offer a consumer that releases
+        // rows at commit.
         //
         // `messages 'true'` is added only when the connector is configured to capture
         // logical decoding messages. It is not free to leave on: the server then sends
@@ -519,9 +555,13 @@ impl ReplicationStream {
         } else {
             ""
         };
+        let protocol_options = match self.protocol {
+            PgOutputProtocol::StreamingV2 => "proto_version '2', streaming 'on'",
+            PgOutputProtocol::V1Disabled | PgOutputProtocol::V1Server(_) => "proto_version '1'",
+        };
         let query = format!(
             "START_REPLICATION SLOT {slot_name} LOGICAL {start} \
-             (proto_version '1', publication_names '{publication_name}'{messages_option})"
+             ({protocol_options}, publication_names '{publication_name}'{messages_option})"
         );
 
         let mut payload = query.into_bytes();
@@ -701,6 +741,10 @@ impl ReplicationStream {
         self.applied_lsn
     }
 
+    pub(in crate::source::postgres) fn protocol(&self) -> PgOutputProtocol {
+        self.protocol
+    }
+
     async fn send_status_update_if_due(&mut self, request_reply: bool) -> Result<()> {
         if self.last_status_sent.elapsed() >= self.status_interval {
             self.send_status_update(request_reply).await?;
@@ -798,9 +842,55 @@ fn validate_identifier(value: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// `"16.4"`, `"18.1 (Debian 18.1-1)"`, `"14beta1"` → the major version.
+fn parse_server_major(value: &[u8]) -> Option<u32> {
+    let digits: Vec<u8> = value
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_is_negotiated_from_postgresql_14_when_streaming_is_on() {
+        assert_eq!(
+            PgOutputProtocol::choose(true, Some(14)),
+            PgOutputProtocol::StreamingV2
+        );
+        assert_eq!(
+            PgOutputProtocol::choose(true, Some(18)),
+            PgOutputProtocol::StreamingV2
+        );
+        assert_eq!(
+            PgOutputProtocol::choose(true, Some(13)),
+            PgOutputProtocol::V1Server(Some(13))
+        );
+        assert_eq!(
+            PgOutputProtocol::choose(true, None),
+            PgOutputProtocol::V1Server(None)
+        );
+        assert_eq!(
+            PgOutputProtocol::choose(false, Some(18)),
+            PgOutputProtocol::V1Disabled
+        );
+    }
+
+    #[test]
+    fn the_major_version_is_read_from_every_server_version_spelling() {
+        assert_eq!(parse_server_major(b"16.4"), Some(16));
+        assert_eq!(
+            parse_server_major(b"18.1 (Debian 18.1-1.pgdg120+1)"),
+            Some(18)
+        );
+        assert_eq!(parse_server_major(b"14beta1"), Some(14));
+        assert_eq!(parse_server_major(b"9.6.24"), Some(9));
+        assert_eq!(parse_server_major(b""), None);
+    }
 
     #[test]
     fn an_identifier_with_a_quote_or_paren_is_refused() {

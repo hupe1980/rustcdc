@@ -69,7 +69,7 @@ docs_rs_url = "https://docs.rs/rustcdc"
 license = "MIT OR Apache-2.0"
 # Shown in the header and in the structured data. Checked against the workspace
 # manifest by `crates/rustcdc-server/tests/architecture.rs`, so it cannot drift.
-version = "0.21.0"
+version = "0.22.0"
 rust_version = "1.97.0"
 # Used for the Open Graph and Twitter card images.
 og_image = "/og.png"
@@ -107,6 +107,9 @@ path = "/docs/connectors/sqlserver/"
 [[extra.nav.pages]]
 title = "Snowflake"
 path = "/docs/snowflake/"
+[[extra.nav.pages]]
+title = "Supported versions"
+path = "/docs/supported-versions/"
 
 [[extra.nav]]
 title = "Configure"
@@ -150,6 +153,9 @@ path = "/docs/deployment/"
 title = "Operations"
 path = "/docs/operations/"
 [[extra.nav.pages]]
+title = "Console"
+path = "/docs/console/"
+[[extra.nav.pages]]
 title = "Incident runbook"
 path = "/docs/runbook/"
 [[extra.nav.pages]]
@@ -170,6 +176,9 @@ path = "/docs/engineering/"
 [[extra.nav.pages]]
 title = "Reliability testing"
 path = "/docs/reliability-testing/"
+[[extra.nav.pages]]
+title = "Performance"
+path = "/docs/performance/"
 [[extra.nav.pages]]
 title = "Comparison"
 path = "/docs/library-parity-matrix/"

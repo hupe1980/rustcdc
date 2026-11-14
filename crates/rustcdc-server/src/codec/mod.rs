@@ -461,8 +461,8 @@ mod tests {
         );
     }
 
-    /// A registry-backed codec with neither an inline table nor a `registry_ref`
-    /// used to fail only when the sink was built, long after startup.
+    /// A registry-backed codec with neither an inline table nor a `registry_ref` is
+    /// rejected by validation, not when the sink is built long after startup.
     #[test]
     fn registry_backed_codec_without_a_registry_is_rejected() {
         let parsed: CodecConfig = toml::from_str(r#"type = "avro_confluent""#).expect("parse");

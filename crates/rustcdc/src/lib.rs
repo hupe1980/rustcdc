@@ -58,9 +58,8 @@ mod markdown_doctests {
     #[doc = include_str!("../../../site/content/docs/schema-evolution.md")]
     mod schema_evolution {}
 
-    // Every remaining page that carries a Rust block. The set used to be the five pages
-    // above, which meant a sample in the runbook or the deployment guide could rot
-    // silently — and those are the pages an operator copies from under pressure.
+    // Every remaining page that carries a Rust block: the runbook and the deployment guide
+    // are the pages an operator copies from under pressure, so their samples must not rot.
     #[doc = include_str!("../../../site/content/docs/deployment.md")]
     mod deployment {}
 
@@ -116,13 +115,14 @@ pub use crate::core::{
     Error, ErrorChain, ErrorKind, ErrorReport, Event, EventBatch, EventBuilder,
     EventIdempotencyGuard, EventTracer, FingerprintError, HEALTH_MIN_CONFIGURABLE_STALL_MS,
     HealthVerdict, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
-    NoRowWrite, Offset, Operation, PostCommitSourceConfirmPolicy, Result, RowWrite,
-    RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl, RuntimeObservability, RuntimeOptions,
-    RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SlotWalStatus,
-    SnapshotMetadata, SourceErrorKind, SourceMetadata, StallCause, StallOwner, StructuredLogger,
-    TransactionBoundaryPolicy, TransactionMetadata, TransformErrorPolicy, TransportConfig,
-    ValidationError, ValidationErrorPolicy, ValidationErrors, fingerprint_event_stable,
-    fingerprint_event_transient, render_error_chain, write_runtime_metrics_prometheus,
+    NoRowWrite, Offset, OpenTransaction, Operation, PostCommitSourceConfirmPolicy, Result,
+    RowWrite, RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl, RuntimeObservability,
+    RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SlotWalStatus,
+    SnapshotMetadata, SourceErrorKind, SourceMetadata, StallCause, StallOwner,
+    StreamedTransactions, StructuredLogger, TransactionBoundaryPolicy, TransactionMetadata,
+    TransformErrorPolicy, TransportConfig, ValidationError, ValidationErrorPolicy,
+    ValidationErrors, fingerprint_event_stable, fingerprint_event_transient, render_error_chain,
+    write_runtime_metrics_prometheus,
 };
 #[cfg(feature = "metrics")]
 pub use crate::core::{

@@ -473,9 +473,9 @@ impl Error {
     /// check reports the pipeline as running. That is the data loss a dead-letter queue
     /// exists to prevent, delivered by the dead-letter queue itself.
     ///
-    /// This lived only in `rustcdc-server` until it was noticed that an embedder writing
-    /// their own quarantine path had `kind()` and nothing else — and `kind()` returns
-    /// [`ErrorKind::Terminal`] for both halves of exactly the distinction they needed.
+    /// In the library because an embedder writing their own quarantine path otherwise has
+    /// only `kind()`, which returns [`ErrorKind::Terminal`] for both halves of exactly the
+    /// distinction they need.
     ///
     /// # The default is `false`, deliberately
     ///
@@ -925,9 +925,9 @@ mod report_tests {
 
     #[test]
     fn the_alternate_flag_does_not_walk_the_chain() {
-        // The doc comment used to claim `{:#}`-style chain printers work. They do not:
-        // thiserror does not implement alternate-flag chaining, so `{:#}` is identical to
-        // `{}`. Pinned so the claim cannot quietly return.
+        // `{:#}`-style chain printers do not work: thiserror does not implement
+        // alternate-flag chaining, so `{:#}` is identical to `{}`. Pinned so the docs
+        // cannot quietly claim otherwise.
         let error = Error::CheckpointError("disk full".into()).context("saving the barrier");
         assert_eq!(format!("{error:#}"), format!("{error}"));
     }

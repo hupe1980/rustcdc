@@ -233,9 +233,9 @@ impl MysqlStreamHandle {
                     // pretended otherwise would replay it.
                     //
                     // The event itself is subject to the same include/exclude lists as
-                    // every row event. It used to bypass them, so an operator who
-                    // allow-listed `app.orders` still received `ALTER TABLE` statements —
-                    // full column lists included — for every other table on the server.
+                    // every row event, or an operator who allow-listed `app.orders` would
+                    // receive `ALTER TABLE` statements — full column lists included — for
+                    // every other table on the server.
                     if table_is_allowed(
                         Some(captured.schema.as_str()),
                         &captured.table,

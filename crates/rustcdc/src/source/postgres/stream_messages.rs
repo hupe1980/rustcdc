@@ -127,16 +127,9 @@ impl PostgresStreamHandle {
         let mut map = serde_json::Map::new();
         let mut unavailable = Vec::new();
         for (i, value) in values.iter().enumerate() {
-            // A tuple with more columns than the cached RELATION means our schema view
-            // is stale — the table gained a column and we missed (or have not yet
-            // processed) the new RELATION message.
-            //
-            // This used to fall back to the literal name `"?"`. Because the row is
-            // assembled into a `serde_json::Map`, *every* overflow column collapsed
-            // onto that one key and overwrote the previous one — silent, unlogged data
-            // destruction. Failing is the only safe response: the alternative is
-            // emitting a row that claims to be complete while having quietly discarded
-            // columns.
+            // More columns than the cached RELATION means our schema view is stale. Fail:
+            // any placeholder name would collapse the extra columns onto one JSON key and
+            // emit a row that looks complete while it has lost values.
             let Some(column) = relation.columns.get(i) else {
                 return Err(Error::SourceError(format!(
                     "postgres tuple for relation '{}.{}' (oid {}) has {} values but the \
@@ -807,26 +800,22 @@ impl PostgresStreamHandle {
                     }
                 }
                 PgOutputMessage::Unknown(tag) => {
-                    // Not every unhandled tag is equally safe to skip.
-                    //
-                    // The connector negotiates `proto_version '1'`, under which the
-                    // server must not send v2 streaming or v3 two-phase messages. If one
-                    // arrives anyway, our view of transaction boundaries is wrong, and
-                    // silently skipping is dangerous in a specific way: dropping a
-                    // Stream Abort ('A') means we commit data the source rolled back.
-                    // Treat those as protocol violations.
+                    // Not every unhandled tag is equally safe to skip. Stream messages
+                    // never reach the decoder: the streaming transport's assembler consumes
+                    // them, and `sql_peek` negotiates v1. One arriving here means our view of
+                    // transaction boundaries is wrong, and skipping a Stream Abort ('A') would
+                    // commit data the source rolled back.
                     match tag {
                         // v2 streaming: Stream Start/Stop/Commit/Abort, Stream Prepare.
                         // v3 two-phase: Begin Prepare, Prepare, Commit Prepared,
                         // Rollback Prepared.
                         b'S' | b'E' | b'c' | b'A' | b'p' | b'b' | b'P' | b'K' | b'r' => {
                             return Err(Error::SourceError(format!(
-                                "postgres sent pgoutput message '{}' (0x{tag:02x}), which \
-                                 belongs to protocol version 2 or 3, but this connector \
-                                 negotiated proto_version 1 and cannot interpret it. \
-                                 Skipping it would misrepresent transaction boundaries — \
-                                 and skipping a Stream Abort would commit data the source \
-                                 rolled back. This indicates a server/plugin mismatch.",
+                                "postgres pgoutput message '{}' (0x{tag:02x}) reached the \
+                                 decoder outside a stream it can assemble. Skipping it would \
+                                 misrepresent transaction boundaries — and skipping a Stream \
+                                 Abort would commit data the source rolled back. This \
+                                 indicates a server/plugin mismatch.",
                                 tag as char
                             )));
                         }
@@ -844,9 +833,8 @@ impl PostgresStreamHandle {
                         // RELATION's OID and modifier, which resolves enums and domains by
                         // name.
                         //
-                        // `M` is no longer here: it is decoded when
-                        // `capture_logical_messages` is set, and the server does not send
-                        // it otherwise.
+                        // `M` is not here: it is decoded when `capture_logical_messages` is
+                        // set, and the server does not send it otherwise.
                         other => {
                             if self.warned_unknown_messages.insert(other) {
                                 tracing::warn!(

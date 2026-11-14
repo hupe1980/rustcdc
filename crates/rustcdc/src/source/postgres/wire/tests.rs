@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 
 use crate::core::{RustlsClientConfig, TransportConfig};
 
-use super::{ReplicationParams, ReplicationStream, WalMessage};
+use super::{PgOutputProtocol, ReplicationParams, ReplicationStream, WalMessage};
 
 /// What the fake server observed from the client, for assertions after the fact.
 #[derive(Debug, Default)]
@@ -314,6 +314,7 @@ fn params<'a>(port: u16, transport: &'a TransportConfig, start_lsn: u64) -> Repl
         start_lsn,
         connect_timeout: Duration::from_secs(10),
         capture_logical_messages: false,
+        stream_in_progress: false,
     }
 }
 
@@ -350,6 +351,30 @@ async fn capturing_logical_messages_adds_the_messages_option() {
     assert!(
         query.contains("proto_version '1'"),
         "the negotiated version must not change with the option: {query}"
+    );
+}
+
+/// Streaming asks for v2 with `streaming 'on'` from a server that reports 14 or later. The
+/// scripted server reports 16.
+#[tokio::test]
+async fn streaming_in_progress_transactions_negotiates_v2_with_streaming_on() {
+    let (port, _client_tls, server) =
+        spawn_server(None, Auth::None, Behaviour::SendOneRecord).await;
+    let transport = TransportConfig::plaintext();
+
+    let mut replication_params = params(port, &transport, 0x900);
+    replication_params.stream_in_progress = true;
+    let mut stream = ReplicationStream::connect(replication_params)
+        .await
+        .expect("replication stream starts");
+    assert_eq!(stream.protocol(), PgOutputProtocol::StreamingV2);
+    let _ = stream.recv(Duration::from_secs(5)).await.expect("receives");
+    drop(stream);
+
+    let query = server.await.expect("server task").replication_query;
+    assert!(
+        query.contains("(proto_version '2', streaming 'on', publication_names"),
+        "{query}"
     );
 }
 

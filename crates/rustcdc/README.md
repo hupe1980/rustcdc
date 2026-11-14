@@ -230,7 +230,7 @@ permanent silent stall would be worse.
 
 | | |
 |---|---|
-| **Connectors** | PostgreSQL (logical replication / pgoutput), MySQL and MariaDB (binlog, GTID), SQL Server (CDC capture tables) |
+| **Connectors** | PostgreSQL (logical replication / pgoutput; on 14+ a large transaction streams while it runs and is released at its commit), MySQL and MariaDB (binlog, GTID), SQL Server (CDC capture tables) |
 | **Snapshots** | DBLog-style resumable incremental snapshot, pausable and stoppable in flight, implemented once and shared by every connector — including yours. Never writes to the source, so it works on a read replica. Chunk cursors persist inside the checkpoint offset, so a restart resumes at the chunk boundary; `request_incremental_snapshot` adds tables to a running pipeline |
 | **Checkpoints** | In-memory and file-backed; file writes are atomic, fsynced and SHA-256 checksummed, with a single-writer lease, and every filesystem call runs on a blocking worker rather than on your executor |
 | **Transforms** | Masking, filtering, projection, field mapping, routing, unwrapping, outbox — plus a sandboxed WASM stage |

@@ -78,10 +78,9 @@ impl Fixture {
     /// # Errors
     ///
     /// Returns an error when the fixture is not structurally valid — see
-    /// [`Fixture::validate`], which this runs. It used to `assert_eq!` the message count
-    /// instead, panicking inside a library on caller-supplied data; every other constructor in
-    /// this crate returns a `Result`, and a fixture builder is exactly the kind of caller that
-    /// wants to report the problem rather than abort.
+    /// [`Fixture::validate`], which this runs. A library must not panic on caller-supplied
+    /// data, and a fixture builder is exactly the kind of caller that wants to report the
+    /// problem rather than abort.
     pub fn new(metadata: FixtureMetadata, messages: Vec<FixtureMessage>) -> Result<Self, String> {
         let fixture = Self { metadata, messages };
         fixture.validate()?;
@@ -325,8 +324,8 @@ mod tests {
         assert!(error.contains("Non-contiguous"), "{error}");
         msg2.seq = 1;
 
-        // A declared count that disagrees with the array is refused, which is the check that
-        // used to exist only in `new` and so never ran for a fixture loaded from a file.
+        // A declared count that disagrees with the array is refused by `validate`, so the
+        // check also runs for a fixture loaded from a file.
         let mut miscounted = metadata.clone();
         miscounted.message_count = 3;
         let error = Fixture::new(miscounted, vec![msg1, msg2])
@@ -394,9 +393,8 @@ mod tests {
         let message = FixtureMessage {
             seq: 0,
             message_type: "Insert".to_string(),
-            // A valid Insert payload. This used to be `{"table":..,"columns":[..]}`, which is
-            // not a shape any message type accepts — it passed only because `Fixture::new`
-            // did not validate, so a round-trip test was round-tripping an invalid fixture.
+            // A valid Insert payload: `Fixture::new` validates, so a round-trip test cannot
+            // round-trip an invalid fixture.
             payload: r#"{"table":"test","after":{"id":"1","value":"x"}}"#.to_string(),
             tags: vec![],
         };

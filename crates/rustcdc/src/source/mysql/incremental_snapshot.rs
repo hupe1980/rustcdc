@@ -297,12 +297,12 @@ impl IncrementalSnapshotBackend for MysqlSnapshotBackend {
             ))
         })?;
 
-        // `Executed_Gtid_Set` is the last column of `SHOW MASTER STATUS` /
-        // `SHOW BINARY LOG STATUS`, so it costs no extra round trip — the row is already here.
-        // Absent or empty means `gtid_mode = OFF`, and the bracket falls back to the ordinal
-        // test; a *malformed* value is an error rather than an empty set, because silently
-        // shrinking a watermark is the failure this whole mechanism exists to avoid.
-        let raw_gtids: String = row.take(4).unwrap_or_default();
+        // Read by name, not position: MariaDB 12.3 puts `Gtid_Binlog_Pos` where MySQL puts
+        // `Executed_Gtid_Set`, and it is no watermark — it advances at the binlog flush, before
+        // the engine commit. Absent (every MariaDB) or empty (`gtid_mode = OFF`) means the
+        // ordinal bracket; a *malformed* value is an error rather than an empty set, because
+        // silently shrinking a watermark is the failure this mechanism exists to avoid.
+        let raw_gtids: String = row.take("Executed_Gtid_Set").unwrap_or_default();
         let executed_gtids = super::gtid::GtidSet::parse(&raw_gtids).map_err(|error| {
             Error::SourceError(format!(
                 "incremental snapshot: could not parse Executed_Gtid_Set '{raw_gtids}': {error}. \
@@ -489,8 +489,8 @@ fn mysql_row_to_json(row: &mysql_async::Row) -> serde_json::Value {
 
 /// Convert a chunk-read value using the connector's single shared rule.
 ///
-/// This module used to carry its own near-identical copy, which is how two paths of the
-/// same connector can drift on something as load-bearing as the JSON type of a column.
+/// Not a local copy: two paths of the same connector could then drift on something as
+/// load-bearing as the JSON type of a column.
 use super::query::mysql_value_to_json;
 
 #[cfg(test)]

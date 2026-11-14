@@ -619,12 +619,10 @@ async fn the_wasm_pool_transforms_concurrently() {
     // Run `POOL` transforms concurrently, then ask the pool how many slots were ever
     // busy at the same moment.
     //
-    // This used to compare wall-clock time for `POOL` concurrent transforms against a
-    // per-event floor measured on its own. That measures the right property and measures
-    // it unreliably: under a full `cargo test` the four worker threads contend with every
-    // other test binary, so the comparison fails against a pool that is working
-    // perfectly. The high-water mark is the same property observed directly, and a busy
-    // machine cannot turn it into a false negative.
+    // Not wall-clock time: under a full `cargo test` the worker threads contend with every
+    // other test binary, so a timing comparison fails against a pool that is working. The
+    // high-water mark is the same property observed directly, and a busy machine cannot
+    // turn it into a false negative.
     let mut handles = Vec::with_capacity(POOL);
     for i in 0..POOL {
         let pipeline = std::sync::Arc::clone(&pipeline);

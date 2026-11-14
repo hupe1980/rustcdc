@@ -239,8 +239,8 @@ and no transaction ID backlog accumulates. Chunk cursors are persisted inside th
 offset — the same atomic, fsynced, checksummed write as the stream position — so a restart
 mid-snapshot resumes at the chunk boundary instead of starting the table over.
 
-`RuntimeConfig::with_snapshot_tables` is the older blocking path, kept for the case where you
-want one consistent read and do not care that the stream waits for it. Set one or the other,
+`RuntimeConfig::with_snapshot_tables` is the blocking path, for when you want one consistent
+read and the stream can wait for it. Set one or the other,
 never both.
 
 ## 7. Know whether it is running

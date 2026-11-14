@@ -129,6 +129,8 @@ pub struct AdminStateData {
     /// describes one continuous condition rather than an accumulation of unrelated ones.
     #[serde(skip)]
     pub stalled_since: Option<std::time::Instant>,
+    /// Transactions the source is streaming before their commit, from the last poll.
+    pub streamed_transactions: Option<rustcdc::StreamedTransactions>,
     pub shutdown_requests_os_signal_total: u64,
     pub shutdown_completions_stopped_total: u64,
     pub shutdown_completions_error_total: u64,
@@ -709,6 +711,7 @@ impl AdminState {
                 health_verdict: None,
                 health_stall_cause: None,
                 stalled_since: None,
+                streamed_transactions: None,
                 shutdown_requests_os_signal_total: 0,
                 shutdown_completions_stopped_total: 0,
                 shutdown_completions_error_total: 0,
@@ -2258,6 +2261,7 @@ impl AdminState {
         // Latch the verdict *before* the snapshot is consumed by the renderer, so
         // `/livez` and `/readyz` can act on it. See `AdminStateData::health_verdict`.
         d.record_health_verdict(&runtime_metrics.runtime_admin.health);
+        d.streamed_transactions = runtime_metrics.runtime_admin.streamed_transactions.clone();
         d.runtime_metrics = runtime_metrics.render_prometheus();
         d.checkpoint_age_seconds = checkpoint_age_seconds;
         d.last_terminal_reason_code = None;
@@ -3096,9 +3100,8 @@ fn slo_reasons(data: &AdminStateData) -> Vec<String> {
 ///
 /// Deliberately not inside the `slo` object: a verdict is not a service-level indicator,
 /// it is the headline answer, and §1 of the runbook opens by telling an operator to curl
-/// this endpoint. Until it was added, the verdict was reachable only by scraping
-/// `/metrics` and grepping a one-hot gauge — for the single field that says whether the
-/// pipeline is working.
+/// this endpoint rather than scrape `/metrics` and grep a one-hot gauge for the single
+/// field that says whether the pipeline is working.
 ///
 /// `stall_cause` is the stable discriminant rather than the prose: it is what routes a
 /// page and what `/readyz` reports. `stalled_for_seconds` is how long *this* condition
@@ -3115,6 +3118,15 @@ pub(crate) fn health_json(data: &AdminStateData) -> serde_json::Value {
         // Who can fix it and whether a restart would: the routing `/livez` acts on.
         "owner": cause.map(|cause| cause.owner().as_str()),
         "restart_helps": cause.map(|cause| cause.restart_helps()),
+    })
+}
+
+pub(crate) fn source_json(data: &AdminStateData) -> serde_json::Value {
+    serde_json::json!({
+        "open_transaction": data
+            .streamed_transactions
+            .as_ref()
+            .and_then(|streamed| streamed.largest.as_ref()),
     })
 }
 
@@ -3334,6 +3346,9 @@ async fn status_authed(
         // runtime's live view: per-table cursors, completion flags and row counters that
         // no admin-side counter could reconstruct. `None` when no snapshot is in flight.
         "incremental_snapshot": snapshot_progress,
+        // A transaction the source is receiving before its commit: what an otherwise idle
+        // pipeline is doing. Absent when none is open.
+        "source": source_json(&data),
         "audit": {
             "entries_total": data.audit_entries_total,
             "recent_entries": data.audit_recent_entries,
@@ -3440,8 +3455,7 @@ async fn openapi_document(
     // It stays **unauthenticated** — it describes the shape of the API rather than any of
     // this instance's state, carries no configuration, and requiring a credential to
     // discover how to authenticate is a loop. But unauthenticated and unmetered are
-    // different things, and this was briefly both: it was the only route that was neither
-    // authorised nor limited while serving ~10 KB of freshly-built JSON, which is a cheap
+    // different things: unlimited, ~10 KB of freshly-built JSON per request is a cheap
     // asymmetric-cost request against a process that is also running the pipeline.
     //
     // Shares the `Status` scope rather than adding a fourth limiter: the budget an operator

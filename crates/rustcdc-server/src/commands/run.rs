@@ -1060,6 +1060,10 @@ pub(crate) mod tests {
             reselect_unavailable_columns: false,
             capture_logical_messages: false,
             slot_state_sample_interval_ms: None,
+            stream_in_progress_transactions: true,
+            stream_buffer_memory_bytes:
+                rustcdc::PostgresSourceConfig::default_stream_buffer_memory_bytes(),
+            stream_spill_directory: None,
         };
         AppConfig {
             api_version: AppConfig::SUPPORTED_API_VERSION.to_string(),

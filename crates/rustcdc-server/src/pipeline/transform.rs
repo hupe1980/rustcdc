@@ -182,12 +182,10 @@ enum TransformRuntime {
     /// A pool of independently-lockable rustcdc `WasmRuntime`s (each auto-inits on
     /// first transform).
     ///
-    /// This is a pool of *runtimes* rather than the single runtime it used to be,
-    /// because `WasmRuntime::transform` takes `&mut self`. That signature forces an
-    /// exclusive lock around every transform, which serialised the whole stage — so
-    /// both `wasm.instance_pool_size` and `runtime.prepare_parallelism` did nothing in
-    /// WASM mode. `instance_pool_size` allocated N wasmtime instances of which exactly
-    /// one could ever run.
+    /// A pool of *runtimes* rather than one, because `WasmRuntime::transform` takes
+    /// `&mut self`. That signature forces an exclusive lock around every transform, so a
+    /// single runtime serialises the whole stage: `wasm.instance_pool_size` and
+    /// `runtime.prepare_parallelism` would do nothing, and only one of N instances could run.
     ///
     /// Upstream is built for concurrency one layer down: `WasmModule::transform_bytes`
     /// takes `&self` and dispatches across a semaphore-guarded instance pool. Only the
@@ -437,11 +435,9 @@ impl TransformPipeline {
     /// High-water mark of simultaneously-busy WASM pool slots, or `None` outside WASM mode.
     ///
     /// Public because `tests/wasm_transform.rs` asserts the pool's concurrency with it.
-    /// That test used to compare wall-clock time for N concurrent transforms against a
-    /// per-event floor, which measures the right property unreliably: under a full
-    /// `cargo test` the worker threads contend with every other test binary and the
-    /// comparison fails against a pool that is working. A high-water mark is the same
-    /// property observed directly, and does not care how busy the machine is.
+    /// Wall-clock comparisons measure that property unreliably: under a full `cargo test`
+    /// the worker threads contend with every other test binary. A high-water mark is the
+    /// same property observed directly, and does not care how busy the machine is.
     ///
     /// It is also the number an operator needs. `instance_pool_size` reports what was
     /// configured; a pool of eight that never exceeds one slot in use is

@@ -46,10 +46,9 @@ pub enum DlqTarget {
     /// (`ApproximateAgeOfOldestMessage`) that page someone when a quarantined record is
     /// going stale.
     ///
-    /// It also closes a real hole. Before this, the only durable target was a Kafka topic,
-    /// so an AWS deployment writing to Snowflake or Iceberg with no Kafka anywhere had
-    /// nothing but a file on a pod filesystem — which is gone at exactly the moment the
-    /// operator reaches for it.
+    /// It is also the durable target for an AWS deployment writing to Snowflake or Iceberg
+    /// with no Kafka anywhere, which would otherwise have nothing but a file on a pod
+    /// filesystem — gone at exactly the moment the operator reaches for it.
     ///
     /// A **sink** is the opposite shape and SQS is deliberately not offered as one. A CDC
     /// consumer re-reads history: it joins late, replays from a position, runs a second

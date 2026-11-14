@@ -78,11 +78,9 @@ fn metric_names_in_source(dir: &Path, into: &mut BTreeSet<String>) {
 /// rather than tidiness. A metric name is "emitted" only if production code writes it; a
 /// name in a comment or in an assertion is a name nobody scrapes.
 ///
-/// This was not always so, and the consequence was a test that could not fail: the
-/// regression assertion pinning the *removal* of a divergent metric spelling put that
-/// spelling back into the scanned corpus, so an alert rule referencing the dead name
-/// resolved against the assertion forbidding it. The check passed by reading its own
-/// tombstone.
+/// Without the cut the test cannot fail: an assertion pinning the *removal* of a metric
+/// spelling puts that spelling back into the scanned corpus, so an alert rule referencing
+/// the dead name resolves against the assertion forbidding it.
 ///
 /// The cut is at an inline `#[cfg(test)] mod … {` — a module with a body — and not at a
 /// bare `#[cfg(test)] mod tests;` *declaration*, which several modules carry near the top

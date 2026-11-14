@@ -207,13 +207,12 @@ The WASM guest ABI is versioned via the `rustcdc_abi_version()` export. The **cu
 | v1 | < 0.5 | **Removed** (rejected at load) | < 0.5.0 |
 | v2 | 0.5.0 | **Current** | ≥ 0.5.0 |
 
-### Migration guide: v2 → v3 (future)
+### Moving to a new ABI version
 
-When ABI v3 is introduced:
-
-1. The runtime will accept **both v2 and v3** modules and emit a `WARN` log for v2 modules.
-2. Guest modules must update `rustcdc_abi_version()` to return `3` and adapt to any changed calling convention documented in the v3 release notes.
-3. After one minor-version cycle, v2 modules will be **rejected at load time** with a structured `Error::ConfigError` explaining the required migration.
+While two versions are accepted, a module on the older one loads with a `WARN`. To move, return
+the new number from `rustcdc_abi_version()` and adapt to the calling convention its release notes
+document. Once the older version is rejected, loading it fails with an `Error::ConfigError` naming
+the required version.
 
 ### Checking your module's ABI version
 

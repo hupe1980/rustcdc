@@ -58,11 +58,9 @@ fn assert_matches_golden_with_expected_error(
     // the ones that matter here — a column may not be both listed as unavailable and present in
     // the payload, and a key-only before-image may not also carry unavailable columns.
     //
-    // Checked **before** the `UPDATE_GOLDENS` branch, deliberately. It used to run only on the
-    // comparison path, so re-blessing wrote the golden and returned without validating anything
-    // — a run that reported `ok` having checked nothing, and the one moment a contributor is
-    // most likely to be wrong about what the events should look like. CI caught it on the next
-    // run, so this was never a hole in the suite; it was a hole in the feedback.
+    // Checked **before** the `UPDATE_GOLDENS` branch, deliberately: on the comparison path
+    // alone, re-blessing would write the golden and report `ok` having checked nothing — at the
+    // one moment a contributor is most likely to be wrong about what the events should look like.
     for (index, event) in actual_events.iter().enumerate() {
         if let Err(errors) = event.validate() {
             panic!(
@@ -138,11 +136,9 @@ fn assert_matches_golden_with_expected_error(
 /// comparison then passes whenever the default happens to be the right answer, which means
 /// the suite is not pinning that field at all: it is agreeing with itself.
 ///
-/// This was live. Forty of the forty-one goldens predated `before_is_key_only` and did not
-/// record it; each loaded as `false`, which was correct for those fixtures, so nothing
-/// failed. Nothing would have failed either if a future field's default were *wrong* for
-/// them — the recorded answer would simply have been silently incomplete, which is the
-/// property a golden exists to not have.
+/// Nothing fails either when a new field's default is *wrong* for an old golden — the
+/// recorded answer is simply silently incomplete, which is the property a golden exists to
+/// not have.
 ///
 /// Fields with `skip_serializing_if` are legitimately absent when empty, so the comparison
 /// is against what *this* event actually serializes rather than against a fixed field list.

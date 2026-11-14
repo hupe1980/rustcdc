@@ -56,7 +56,7 @@ async fn collect(
     Ok(collected)
 }
 
-/// Values of the exact types whose decoder previously returned `null` must round trip.
+/// Values of types that need a dedicated decoder, rather than `null`, must round trip.
 #[tokio::test]
 async fn sqlserver_decodes_non_trivial_types_without_loss() -> rustcdc::Result<()> {
     if sqlserver_testkit::skip_docker_test("sqlserver type-fidelity test") {

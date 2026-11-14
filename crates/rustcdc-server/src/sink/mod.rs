@@ -558,12 +558,10 @@ pub struct SinkBinding {
     /// `runtime.max_event_bytes`, enforced against the payload the transport will
     /// actually send.
     ///
-    /// This used to live in `send_prepared_event_with_timeout`, which serialised every
-    /// event to JSON solely to measure it and then threw the buffer away — 13.9 µs per
-    /// event of pure waste, measured, before the codec then encoded the same event
-    /// again. Worse, for Avro or Protobuf the limit was measuring a JSON rendering that
-    /// is never transmitted, so it rejected events that would have fitted and could not
-    /// be calibrated against a broker's `max.message.bytes`.
+    /// Measuring a separate JSON encode would cost 13.9 µs per event before the codec
+    /// encodes it again, and for Avro or Protobuf would measure a rendering that is never
+    /// transmitted — rejecting events that fit, and impossible to calibrate against a
+    /// broker's `max.message.bytes`.
     pub max_event_bytes: usize,
     /// Where this binding publishes its extended counters so the scrape path can read
     /// them after the binding disappears into a `BoxedSink`.
@@ -1194,12 +1192,9 @@ mod size_limit_tests {
         SinkConfig::Http(cfg)
     }
 
-    /// The whole point of moving the limit: it now measures the bytes the transport
-    /// sends, so the *same* event can pass under one codec and fail under another.
-    ///
-    /// Previously both cases measured the identical JSON rendering, which meant an
-    /// operator calibrating `max_event_bytes` against a broker's `max.message.bytes`
-    /// was calibrating against a payload the broker never sees.
+    /// The limit measures the bytes the transport sends, so the *same* event can pass
+    /// under one codec and fail under another — which is what lets an operator calibrate
+    /// `max_event_bytes` against a broker's `max.message.bytes`.
     #[tokio::test]
     async fn the_limit_measures_the_encoded_payload_not_a_json_rendering() {
         let event = wide_event();

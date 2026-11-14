@@ -104,7 +104,7 @@ impl From<&crate::cli::AdminAuthClientArgs> for AdminAuthClientConfig {
 /// POST a JSON body to a write-scoped admin endpoint.
 ///
 /// Separate from `http_get` only in method, body and which token it presents — the write
-/// token, which until now the CLI accepted and never used.
+/// token.
 pub(super) async fn http_post_json(
     url: &str,
     body: &serde_json::Value,

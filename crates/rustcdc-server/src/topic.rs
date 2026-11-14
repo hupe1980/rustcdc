@@ -218,9 +218,9 @@ fn unknown_placeholder_hint(name: &str) -> &'static str {
 ///
 /// Every Kafka topic in this configuration that is *not* `sink.kafka.topic` is one of
 /// these: the dead-letter topic, the compacted state topic, the admin notification and
-/// signal-ingress topics. All four used to be checked for emptiness and nothing else, so
-/// a name the broker would reject — a space, a `#`, 300 characters, `..` — loaded
-/// cleanly and failed on first use. For the DLQ that is precisely the worst moment: the
+/// signal-ingress topics. Checking them for emptiness alone would let a name the broker
+/// rejects — a space, a `#`, 300 characters, `..` — load cleanly and fail on first use.
+/// For the DLQ that is precisely the worst moment: the
 /// dead-letter path runs during an incident, and a topic name discovered to be invalid
 /// then turns a quarantine into an outage.
 ///

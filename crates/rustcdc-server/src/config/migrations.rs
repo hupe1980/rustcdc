@@ -158,10 +158,9 @@ fn normalize_pipeline(mut raw: serde_json::Value) -> serde_json::Value {
 /// Split the legacy flat `[state]` table into `state.offset` / `state.schema_history`.
 ///
 /// Rejects any other key under the flat shape. This function rebuilds the table from
-/// `dir` and `backend` alone, so anything else was previously **discarded in silence** —
-/// a `snapshot_tables` key indented one table too far parsed cleanly and did nothing,
-/// and the unknown-key guard in the loader could not see it because the migration had
-/// already removed it.
+/// `dir` and `backend` alone, so anything else would be **discarded in silence** — a
+/// `snapshot_tables` key indented one table too far would parse cleanly and do nothing,
+/// invisible to the loader's unknown-key guard because the migration had already removed it.
 fn normalize_state(mut raw: serde_json::Value) -> Result<serde_json::Value, ConfigError> {
     if let Some(obj) = raw.as_object_mut() {
         // Only split if state is a flat object (has dir/backend at the top level).

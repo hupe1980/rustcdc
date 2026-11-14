@@ -31,18 +31,26 @@ pub(super) async fn start_postgres_snapshot_internal(
         })?
     };
 
-    client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .await
-        .map_err(PgError::from)
-        .map_err(|error| {
-            Error::SourceError(format!(
-                "failed to begin postgres snapshot transaction: {error}"
-            ))
-        })?;
+    // The anchor exports the snapshot and reads the watermark in one statement; every reader
+    // transaction, the first and any reopened after a failed chunk, imports that snapshot.
+    let mut anchor = match SnapshotAnchor::open(connection).await {
+        Ok(anchor) => Some(anchor),
+        Err(error) => {
+            tracing::warn!(
+                target: "rustcdc::source::postgres",
+                error = %error,
+                "postgres snapshot: no anchor connection; the snapshot reads from one point in \
+                 time only until a chunk fails, after which a row written since it began may \
+                 arrive both as a snapshot read and as a stream change",
+            );
+            None
+        }
+    };
+    begin_snapshot_transaction(&client, &mut anchor).await?;
 
     let start_ts = now_millis();
-    let setup_result = build_snapshot_setup(&client, tables, start_ts).await;
+    let watermark = anchor.as_ref().map(|anchor| anchor.watermark);
+    let setup_result = build_snapshot_setup(&client, tables, start_ts, watermark).await;
 
     let (snapshot, states, snapshot_watermark) = match setup_result {
         Ok(value) => value,
@@ -52,7 +60,7 @@ pub(super) async fn start_postgres_snapshot_internal(
         }
     };
 
-    let handle = PostgresSnapshotHandle::new(
+    let mut handle = PostgresSnapshotHandle::new(
         connection.source_type().to_string(),
         snapshot,
         states,
@@ -60,6 +68,7 @@ pub(super) async fn start_postgres_snapshot_internal(
         true,
         snapshot_watermark,
     );
+    handle.anchor = anchor;
 
     {
         let mut state = connection.state.lock().await;
@@ -98,8 +107,12 @@ async fn build_snapshot_setup(
     client: &Arc<Client>,
     tables: &[&str],
     start_ts: u64,
+    anchor_watermark: Option<u64>,
 ) -> Result<(PostgresSnapshot, Vec<TableSnapshotState>, u64)> {
-    let snapshot_watermark = query_current_wal_lsn(client).await?;
+    let snapshot_watermark = match anchor_watermark {
+        Some(watermark) => watermark,
+        None => query_current_wal_lsn(client).await?,
+    };
     let snapshot_id: String = client
         .query_one("SELECT txid_current_snapshot()::text", &[])
         .await
@@ -174,4 +187,107 @@ async fn build_snapshot_setup(
     }
 
     Ok((snapshot, states, snapshot_watermark))
+}
+
+/// The connection holding a snapshot open for the snapshot's readers to import.
+///
+/// Its transaction exports the snapshot and does nothing else, so it cannot fail part-way the way
+/// a reader can. Dropping it closes the connection, which ends the transaction.
+pub(super) struct SnapshotAnchor {
+    _client: Client,
+    task: tokio::task::JoinHandle<()>,
+    snapshot_id: String,
+    pub(super) watermark: u64,
+}
+
+impl SnapshotAnchor {
+    async fn open(connection: &PostgresConnection) -> Result<Self> {
+        let (client, task) = connection.open_client().await?;
+        let anchor = async {
+            client
+                .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .await
+                .map_err(PgError::from)?;
+            // One statement: the watermark and the snapshot are taken together.
+            let row = client
+                .query_one(
+                    "SELECT pg_current_wal_lsn()::text, pg_export_snapshot()",
+                    &[],
+                )
+                .await
+                .map_err(PgError::from)?;
+            Ok::<_, PgError>((row.get::<_, String>(0), row.get::<_, String>(1)))
+        }
+        .await;
+        let (lsn, snapshot_id) = match anchor {
+            Ok(values) => values,
+            Err(error) => {
+                task.abort();
+                return Err(Error::SourceError(format!(
+                    "failed to export a postgres snapshot: {error}"
+                )));
+            }
+        };
+        // Interpolated into `SET TRANSACTION SNAPSHOT`, which takes no parameter.
+        if snapshot_id.is_empty()
+            || !snapshot_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == '-')
+        {
+            task.abort();
+            return Err(Error::SourceError(format!(
+                "postgres exported an unexpected snapshot id '{snapshot_id}'"
+            )));
+        }
+        Ok(Self {
+            _client: client,
+            task,
+            snapshot_id,
+            watermark: super::parser::parse_pg_lsn(&lsn)?,
+        })
+    }
+}
+
+impl Drop for SnapshotAnchor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Begin a reader transaction on the anchor's snapshot, or on a fresh one when there is no anchor
+/// or it is gone — in which case the anchor is dropped and the WARN says what that costs.
+pub(super) async fn begin_snapshot_transaction(
+    client: &Client,
+    anchor: &mut Option<SnapshotAnchor>,
+) -> Result<()> {
+    let begin = |error: tokio_postgres::Error| {
+        Error::SourceError(format!(
+            "failed to begin postgres snapshot transaction: {}",
+            PgError::from(error)
+        ))
+    };
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .map_err(begin)?;
+    let Some(held) = anchor.as_ref() else {
+        return Ok(());
+    };
+    let import = format!("SET TRANSACTION SNAPSHOT '{}'", held.snapshot_id);
+    if let Err(error) = client.batch_execute(&import).await {
+        tracing::warn!(
+            target: "rustcdc::source::postgres",
+            error = %PgError::from(error),
+            "postgres snapshot: its anchor connection is gone; continuing in a new transaction, so \
+             the rest of this snapshot reads a later point in time and a row written since it \
+             began may arrive both as a snapshot read and as a stream change",
+        );
+        *anchor = None;
+        let _ = client.batch_execute("ROLLBACK").await;
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .map_err(begin)?;
+    }
+    Ok(())
 }

@@ -623,3 +623,93 @@ every_tested_mariadb!(
     550,
     "mariadb handoff test"
 );
+
+/// An incremental snapshot on a MariaDB that has written anything at all.
+///
+/// MariaDB assigns every transaction a GTID, and from 12.3 `SHOW MASTER STATUS` reports the
+/// position as a fifth column, `Gtid_Binlog_Pos` (`0-1-3`), where MySQL reports
+/// `Executed_Gtid_Set`. The watermark is read from that column on both.
+#[tokio::test]
+async fn mariadb_incremental_snapshot_reads_every_row_after_a_write() -> rustcdc::Result<()> {
+    install_rustls_provider();
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping mariadb incremental snapshot test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    let container = GenericImage::new("mariadb", matrix::full(matrix::Engine::Mariadb))
+        .with_exposed_port(3306.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
+        .with_cmd(vec![
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-metadata=FULL",
+            "--binlog-row-image=FULL",
+            "--server-id=1",
+        ])
+        .with_env_var("MYSQL_ROOT_PASSWORD", "rootpass")
+        .with_env_var("MYSQL_DATABASE", "cdc")
+        .start()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(3306.tcp())
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    let admin_pool =
+        connect_admin_pool(&format!("mysql://root:rootpass@{host}:{port}/cdc")).await?;
+    for statement in [
+        "CREATE TABLE inc (id BIGINT PRIMARY KEY, note VARCHAR(10)) ENGINE=InnoDB",
+        "INSERT INTO inc VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+    ] {
+        sqlx::query(statement)
+            .execute(&admin_pool)
+            .await
+            .map_err(|error| rustcdc::Error::SourceError(error.to_string()))?;
+    }
+
+    let config = MariaDbSourceConfig::new(MysqlSourceConfig {
+        host,
+        port,
+        user: "root".to_string(),
+        password: "rootpass".to_string().into(),
+        database: "cdc".to_string(),
+        server_id: 310,
+        gtid_mode_enabled: false,
+        binlog_format_check: true,
+        transport: TransportConfig::plaintext(),
+        conn_timeout_secs: 30,
+        stream_poll_interval_ms: 50,
+        max_events_per_poll: 1_000,
+        ..Default::default()
+    });
+    let mut connection = MariaDbConnection::new(config.into_inner());
+    connection.connect().await?;
+    let mut handle = connection
+        .start_incremental_snapshot(
+            rustcdc::IncrementalSnapshotConfig::new(vec!["cdc.inc".to_string()]).with_chunk_size(2),
+            None,
+        )
+        .await?;
+
+    let mut ids = HashSet::new();
+    for _ in 0..100 {
+        for event in handle.next_events(250).await? {
+            if event.op == rustcdc::Operation::Read
+                && let Some(id) = event.after.as_ref().and_then(|row| row.get("id"))
+            {
+                ids.insert(id.to_string().trim_matches('"').to_string());
+            }
+        }
+        if ids.len() == 5 {
+            break;
+        }
+    }
+    connection.close().await;
+    assert_eq!(ids.len(), 5, "every row must be read: {ids:?}");
+    Ok(())
+}

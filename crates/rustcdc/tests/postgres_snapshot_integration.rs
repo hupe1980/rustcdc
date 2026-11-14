@@ -1615,8 +1615,7 @@ async fn postgres_incremental_snapshot_resumes_at_the_chunk_boundary_after_a_res
     // ── First run: consume roughly half the table, then stop abruptly ─────────
     //
     // `save_position` stands in for the crash: it is what a wrapper calls on SIGTERM, and
-    // it is the exact call that used to persist the stream offset while dropping the
-    // chunk cursor.
+    // it must persist the chunk cursor along with the stream offset.
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
     let stop_after = (row_count / 2) as usize;
 
@@ -1917,7 +1916,8 @@ async fn postgres_snapshot_reads_a_table_wider_than_fifty_columns() -> rustcdc::
 /// snapshot starts — permission is checked against the current catalog, not the snapshot's —
 /// so the fetch fails after the first table's rows are in the chunk. The server's SQLSTATE must
 /// be in the error, the snapshot must recover once the grant is restored, and every row of both
-/// tables must arrive exactly once.
+/// tables must arrive exactly once — and nothing written after the snapshot began, whether before
+/// or after the reopen, because the reopened transaction imports the original snapshot.
 #[tokio::test]
 async fn postgres_snapshot_recovers_from_a_failed_chunk_without_losing_rows() -> rustcdc::Result<()>
 {
@@ -1991,8 +1991,13 @@ async fn postgres_snapshot_recovers_from_a_failed_chunk_without_losing_rows() ->
                     "the snapshot never recovered: {errors:#?}"
                 );
                 if errors.len() == 2 {
+                    // Between the failure and the reopen: a snapshot that is one point in
+                    // time must not read it.
                     admin
-                        .batch_execute("GRANT SELECT ON public.second_t TO cdc")
+                        .batch_execute(
+                            "INSERT INTO public.second_t VALUES (7, 'between'); \
+                             GRANT SELECT ON public.second_t TO cdc",
+                        )
                         .await
                         .map_err(pg)?;
                     chunk_size = 2;

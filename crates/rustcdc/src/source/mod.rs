@@ -136,11 +136,10 @@ impl<S: Into<String>> From<Vec<S>> for SnapshotRequest {
 /// [`table_matches`](crate::pipeline::table_matches): `*` and `?` inside a segment,
 /// `"schema.*"` for a whole schema, `"*.name"` for a name in any schema.
 ///
-/// These lists used to match **exact strings only**, while the sink router matched globs
-/// and nothing documented the difference. `table_exclude_list = ["public.tmp_*"]`
-/// therefore excluded nothing, which looks identical to a set of tables that never
-/// changed — and on the include side an allowlist matching nothing looks identical to an
-/// idle database. One semantics now, in one implementation.
+/// The sink router uses the same implementation. Were they to differ,
+/// `table_exclude_list = ["public.tmp_*"]` could exclude nothing, which looks identical to
+/// a set of tables that never changed — and on the include side an allowlist matching
+/// nothing looks identical to an idle database.
 ///
 /// An **unqualified** entry such as `"orders"` matches that table in *every* schema; see
 /// [`crate::core::glob::table_matches`] for why, and
@@ -160,11 +159,9 @@ pub(crate) fn table_is_allowed(
         return true;
     }
 
-    // The matcher is ASCII case-insensitive itself, so nothing is lowered here. That used
-    // to cost four `String` allocations per event — two for the key, two per pattern — and,
-    // more importantly, it was the *only* place the lowering happened: the sink router
-    // called the same matcher on unlowered input, so the two disagreed about a pattern the
-    // documentation promised was equivalent.
+    // The matcher is ASCII case-insensitive itself, so nothing is lowered here: lowering
+    // costs allocations per event, and lowering at this call site alone would make it
+    // disagree with the sink router, which calls the same matcher on unlowered input.
     let key = match schema {
         Some(schema) if !schema.is_empty() => format!("{schema}.{table}"),
         _ => table.to_string(),
@@ -682,6 +679,13 @@ pub trait StreamHandle: Send + Sync {
         None
     }
 
+    /// Transactions being received before their commit, when the connector streams them.
+    ///
+    /// `None` for connectors and protocols that receive a transaction only once it commits.
+    fn streamed_transactions(&self) -> Option<crate::core::StreamedTransactions> {
+        None
+    }
+
     /// A checkpoint offset describing this handle's own durable position.
     ///
     /// The runtime normally derives the checkpoint offset from the delivered event.
@@ -1050,8 +1054,8 @@ mod tests {
         ));
     }
 
-    /// These lists used to match exact strings only, so a pattern excluded nothing —
-    /// indistinguishable from a set of tables that never changed.
+    /// A pattern treated as an exact string excludes nothing — indistinguishable from a
+    /// set of tables that never changed.
     #[test]
     fn table_filter_entries_are_glob_patterns() {
         let none = Vec::new();

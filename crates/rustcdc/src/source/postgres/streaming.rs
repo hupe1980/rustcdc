@@ -5,10 +5,11 @@
 //! table filtering, the snapshot handoff, checkpointing — is shared and untouched.
 //!
 //! Because rustcdc owns the wire client ([`super::wire`]), the pgoutput payload arrives
-//! byte-for-byte as the server produced it, including the `Begin` and `Commit` messages.
-//! Nothing is intercepted, re-encoded, or reconstructed, so the decoder cannot disagree
-//! between the two transports.
+//! byte-for-byte as the server produced it. The one exception is a transaction the server
+//! streams under v2: [`StreamAssembler`] holds it and hands it on at its commit as the v1
+//! bytes it is made of, so the decoder still cannot disagree between the two transports.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,18 @@ use tokio_postgres::Client;
 use crate::core::Result;
 
 use super::decoder::{PgOutputMessageProvider, PgOutputXLogData, PollOutcome};
-use super::wire::{OpenError, ReplicationParams, ReplicationStream, WalMessage};
+use super::stream_assembly::{
+    Assembled, OpenStreamSummary, StreamAssembler, StreamBufferTotals, probe_spill_directory,
+};
+use super::wire::{OpenError, PgOutputProtocol, ReplicationParams, ReplicationStream, WalMessage};
+
+/// A committed streamed transaction being handed on, a poll's worth at a time.
+type Replay = Box<dyn Iterator<Item = Result<PgOutputXLogData>> + Send + Sync>;
+
+enum Ready {
+    Message(PgOutputXLogData),
+    Replay(Replay),
+}
 
 /// Reads the WAL stream over `START_REPLICATION ... LOGICAL`.
 pub(super) struct StreamingPgOutputProvider {
@@ -32,6 +44,10 @@ pub(super) struct StreamingPgOutputProvider {
     /// The connection's ordinary SQL client, shared rather than opened anew. The replication
     /// socket cannot run a catalogue query, and the slot's `wal_status` is only in one.
     state_client: Arc<Client>,
+    /// Present when v2 was negotiated.
+    assembler: Option<StreamAssembler>,
+    /// What the assembler released, not yet handed on.
+    ready: VecDeque<Ready>,
 }
 
 impl StreamingPgOutputProvider {
@@ -63,14 +79,47 @@ impl StreamingPgOutputProvider {
             start_lsn,
             connect_timeout: Duration::from_secs(config.conn_timeout_secs),
             capture_logical_messages: config.capture_logical_messages,
+            stream_in_progress: config.stream_in_progress_transactions,
         })
         .await?;
+
+        let protocol = stream.protocol();
+        let assembler = if protocol == PgOutputProtocol::StreamingV2 {
+            let directory = config.stream_spill_directory();
+            probe_spill_directory(&directory)?;
+            Some(StreamAssembler::new(
+                config.stream_buffer_memory_bytes,
+                directory,
+            ))
+        } else {
+            None
+        };
+        match protocol {
+            PgOutputProtocol::StreamingV2 => tracing::info!(
+                target: "rustcdc::source::postgres",
+                slot = %config.replication_slot_name,
+                "pgoutput v2: large transactions stream while they run; rows are released at commit",
+            ),
+            PgOutputProtocol::V1Disabled => tracing::info!(
+                target: "rustcdc::source::postgres",
+                slot = %config.replication_slot_name,
+                "pgoutput v1: stream_in_progress_transactions = false",
+            ),
+            PgOutputProtocol::V1Server(major) => tracing::info!(
+                target: "rustcdc::source::postgres",
+                slot = %config.replication_slot_name,
+                server_major = ?major,
+                "pgoutput v1: streaming in-progress transactions needs PostgreSQL 14 or later",
+            ),
+        }
 
         Ok(Self {
             stream,
             slot_name: config.replication_slot_name.clone(),
             server_wal_end: start_lsn,
             state_client,
+            assembler,
+            ready: VecDeque::new(),
         })
     }
 
@@ -80,23 +129,41 @@ impl StreamingPgOutputProvider {
         // confirm a position behind one already confirmed.
         self.server_wal_end = self.server_wal_end.max(wal_end);
     }
-}
 
-#[async_trait]
-impl PgOutputMessageProvider for StreamingPgOutputProvider {
-    async fn poll_xlog_data(
+    /// Up to `max` released messages, expanding a committed stream lazily.
+    fn take_ready(&mut self, max: usize) -> Result<Vec<PgOutputXLogData>> {
+        let mut out = Vec::new();
+        while out.len() < max {
+            match self.ready.front_mut() {
+                None => break,
+                Some(Ready::Message(_)) => {
+                    let Some(Ready::Message(message)) = self.ready.pop_front() else {
+                        unreachable!("matched above")
+                    };
+                    out.push(message);
+                }
+                Some(Ready::Replay(replay)) => match replay.next() {
+                    Some(message) => out.push(message?),
+                    None => {
+                        self.ready.pop_front();
+                    }
+                },
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read what the socket has within the budget: block for the first record, then take
+    /// only what is already buffered.
+    async fn read_wal(
         &mut self,
         max_messages: usize,
-        poll_timeout: Duration,
-    ) -> Result<PollOutcome> {
-        let deadline = tokio::time::Instant::now() + poll_timeout;
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<PgOutputXLogData>> {
         let mut messages = Vec::new();
-
         while messages.len() < max_messages.max(1) {
-            // Block for the *first* record, then take only what is already buffered.
             // Waiting the full budget once data has arrived would make every record wait for
-            // the last one, turning a push transport back into a polling one; draining with a
-            // zero budget keeps the batching without the wait.
+            // the last one, turning a push transport back into a polling one.
             let remaining = if messages.is_empty() {
                 deadline.saturating_duration_since(tokio::time::Instant::now())
             } else {
@@ -129,8 +196,50 @@ impl PgOutputMessageProvider for StreamingPgOutputProvider {
                 }
             }
         }
+        Ok(messages)
+    }
+}
 
-        Ok(PollOutcome::Data(messages))
+#[async_trait]
+impl PgOutputMessageProvider for StreamingPgOutputProvider {
+    async fn poll_xlog_data(
+        &mut self,
+        max_messages: usize,
+        poll_timeout: Duration,
+    ) -> Result<PollOutcome> {
+        let deadline = tokio::time::Instant::now() + poll_timeout;
+        let max = max_messages.max(1);
+        loop {
+            let ready = self.take_ready(max)?;
+            if !ready.is_empty() {
+                return Ok(PollOutcome::Data(ready));
+            }
+            let read = self.read_wal(max, deadline).await?;
+            let Some(assembler) = self.assembler.as_mut() else {
+                return Ok(PollOutcome::Data(read));
+            };
+            let budget_spent = read.is_empty();
+            for item in assembler.feed(read)? {
+                self.ready.push_back(match item {
+                    Assembled::Message(message) => Ready::Message(message),
+                    Assembled::Committed(stream) => {
+                        let begin = stream.begin();
+                        let commit = stream.commit();
+                        Ready::Replay(Box::new(
+                            std::iter::once(Ok(begin))
+                                .chain(stream.messages()?)
+                                .chain(std::iter::once(Ok(commit))),
+                        ))
+                    }
+                });
+            }
+            // A poll that read only stream blocks has nothing to hand on yet; keep reading
+            // until the budget is spent rather than report an empty poll, which the caller
+            // would wait out as an idle one.
+            if budget_spent || tokio::time::Instant::now() >= deadline {
+                return Ok(PollOutcome::Data(self.take_ready(max)?));
+            }
+        }
     }
 
     fn waits_for_data(&self) -> bool {
@@ -163,6 +272,41 @@ impl PgOutputMessageProvider for StreamingPgOutputProvider {
 
     async fn sample_slot_state(&mut self) -> Result<Option<super::parser::SlotState>> {
         super::query::query_slot_state(&self.state_client, &self.slot_name).await
+    }
+
+    fn streamed_transactions(&self) -> Option<crate::core::StreamedTransactions> {
+        let assembler = self.assembler.as_ref()?;
+        let StreamBufferTotals {
+            open,
+            memory_bytes,
+            spilled_bytes,
+        } = assembler.totals();
+        let largest = assembler.open_transaction().map(
+            |OpenStreamSummary {
+                 xid,
+                 changes,
+                 bytes,
+                 spilled,
+                 started_at,
+             }| {
+                let started_at_ms = started_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64);
+                crate::core::OpenTransaction::new(
+                    u64::from(xid),
+                    changes,
+                    bytes,
+                    spilled,
+                    started_at_ms,
+                )
+            },
+        );
+        Some(crate::core::StreamedTransactions::new(
+            open,
+            memory_bytes,
+            spilled_bytes,
+            largest,
+        ))
     }
 
     async fn idle_advance(&mut self) -> Result<u64> {

@@ -23,6 +23,23 @@ export function count(n: number): string {
   return n.toLocaleString(undefined, { maximumFractionDigits: n < 10 ? 1 : 0 });
 }
 
+/** 2_100_000 → "2.1M": a magnitude to read at a glance, not a count to audit. */
+export function compact(n: number): string {
+  return n.toLocaleString(undefined, { notation: "compact", maximumFractionDigits: 1 });
+}
+
+/** 1_300_000_000 → "1.3 GB". Decimal units, as disks are sold and `df -H` prints them. */
+export function bytes(n: number): string {
+  const units = ["B", "kB", "MB", "GB", "TB"];
+  let value = n;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  return `${value.toLocaleString(undefined, { maximumFractionDigits: value < 10 ? 1 : 0 })} ${units[unit]}`;
+}
+
 export function secondsSince(iso: string | null | undefined, now = Date.now()): number | null {
   if (!iso) return null;
   const t = Date.parse(iso);

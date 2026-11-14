@@ -397,9 +397,9 @@ pub(super) fn snapshot_progress_prometheus(
     );
 
     // Whether a row filter is in effect, per table. "3,000,000 rows emitted" cannot on its
-    // own distinguish a filter that applied from one that was silently ignored — exactly
-    // the question the on-demand-filter defect made people ask, and it was unanswerable
-    // from outside the process. The expression itself is deliberately **not** exported: it
+    // own distinguish a filter that applied from one that was silently ignored, and
+    // nothing else answers that from outside the process. The expression itself is
+    // deliberately **not** exported: it
     // is raw SQL and can carry column names and literal values that have no business in an
     // unauthenticated metrics scrape. `/status` reports it to an authenticated reader.
     out.push_str(

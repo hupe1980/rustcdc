@@ -1,10 +1,9 @@
 //! Table-name glob matching, shared by every place that names tables by pattern.
 //!
-//! There used to be two: the sink router matched globs, and the connectors'
-//! `table_include_list` / `table_exclude_list` matched exact strings only. Nothing said
-//! so, so `table_include_list = ["public.audit_*"]` silently captured nothing — an
-//! allowlist that matches no table is indistinguishable from a table that never changed.
-//! One implementation, one documented semantics.
+//! One implementation for the sink router and the connectors' `table_include_list` /
+//! `table_exclude_list`: if they disagreed, `table_include_list = ["public.audit_*"]` could
+//! silently capture nothing, and an allowlist that matches no table is indistinguishable
+//! from a table that never changed.
 
 /// Returns `true` if `subject` matches the glob `pattern`.
 ///
@@ -37,7 +36,7 @@ pub(crate) fn glob_segment_matches(pattern: &str, subject: &str) -> bool {
 /// — "try consuming nothing, else consume one byte, recurse both ways" — is exponential:
 /// `a*a*a*a*a*b` against thirty `a`s explores every way of splitting the run and does not
 /// return in any useful time. Patterns here come from operator configuration rather than
-/// untrusted input, so this was a latency cliff rather than a vulnerability, but a config
+/// untrusted input, so this is a latency cliff rather than a vulnerability, but a config
 /// typo should not be able to hang a pipeline.
 ///
 /// The algorithm keeps one remembered `*` position and rewinds to it on a mismatch,
@@ -215,7 +214,7 @@ mod tests {
         assert!(!table_matches("audit_*", "public.orders"));
     }
 
-    /// The behaviour the old doc table denied and the old code implemented.
+    /// An unqualified pattern matches the table name in any schema.
     #[test]
     fn an_unqualified_pattern_matches_every_schema() {
         assert!(table_matches("orders", "orders"));

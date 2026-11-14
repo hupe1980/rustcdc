@@ -23,11 +23,10 @@ pub fn table_matches(pattern: &str, table_key: &str) -> bool {
 }
 
 // Matching is ASCII case-insensitive, and that lives in the matcher rather than at either
-// call site. It used to live only in the connector filter, which meant this function — the
-// one the sink router uses — answered case-sensitively. A server that folds identifiers
-// (PostgreSQL to lower, Snowflake to upper, MySQL depending on the host filesystem) could
-// pass a table through the include list and then match no route, with `drop_unrouted` on by
-// default. See `the_router_and_the_connector_filter_agree_on_case`.
+// call site. If the router answered case-sensitively while the connector filter did not, a
+// server that folds identifiers (PostgreSQL to lower, Snowflake to upper, MySQL depending on
+// the host filesystem) could pass a table through the include list and then match no route,
+// with `drop_unrouted` on by default. See `the_router_and_the_connector_filter_agree_on_case`.
 
 /// A type alias for a [`TableRouter`] that accepts heterogeneous sink types.
 ///

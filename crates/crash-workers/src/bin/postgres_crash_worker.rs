@@ -25,6 +25,8 @@ async fn main() -> rustcdc::Result<()> {
     let checkpoint_dir = PathBuf::from(required_env("CDC_RS_WORKER_CHECKPOINT_DIR")?);
     let marker_file = PathBuf::from(required_env("CDC_RS_WORKER_MARKER_FILE")?);
     let ack_first_batch = optional_bool_env("CDC_RS_WORKER_ACK_FIRST_BATCH");
+    // Signal once a transaction is being held before its commit, instead of on a batch.
+    let until_streaming = optional_bool_env("CDC_RS_WORKER_UNTIL_STREAMING");
     let snapshot_tables = optional_snapshot_tables();
 
     let source_cfg = PostgresSourceConfig {
@@ -62,6 +64,27 @@ async fn main() -> rustcdc::Result<()> {
 
     for _ in 0..80 {
         let batch = runtime.poll_event_batch().await?;
+        if until_streaming {
+            assert!(
+                batch.is_empty(),
+                "nothing is committed, so nothing may be released"
+            );
+            let held = runtime
+                .admin_snapshot()
+                .streamed_transactions
+                .and_then(|streamed| streamed.largest);
+            if let Some(open) = held {
+                // The harness's marker format, with nothing released: the rows are held.
+                write_marker_atomic(
+                    &marker_file,
+                    &format!("events=0\nacked=0\nids=\nheld_changes={}\n", open.changes),
+                )?;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+            continue;
+        }
         if !batch.is_empty() {
             if ack_first_batch {
                 runtime.commit_ack(batch.ack_mode()).await?;

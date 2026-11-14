@@ -20,10 +20,9 @@ impl CdcRuntime {
     /// and chunk counters — read from the live driver rather than from a persisted
     /// checkpoint, so it is current rather than as of the last commit.
     ///
-    /// Before this existed, an operator who triggered
-    /// [`request_incremental_snapshot`](Self::request_incremental_snapshot) could learn how
-    /// many tables the runtime *accepted* and nothing after that; for a multi-hour backfill
-    /// that was the entire operational experience.
+    /// Without it, an operator who triggered
+    /// [`request_incremental_snapshot`](Self::request_incremental_snapshot) learns how many
+    /// tables the runtime *accepted* and nothing after that, for a multi-hour backfill.
     ///
     /// Also reported as [`RuntimeAdminSnapshot::incremental_snapshot`], so anything already
     /// rendering that struct gets it without a second call.
@@ -361,6 +360,7 @@ impl CdcRuntime {
                 .and_then(|s| s.replication_slot_lag_bytes()),
             replication_slot_wal_status: self.last_slot_wal_status,
             replication_slot_safe_wal_size_bytes: self.last_slot_safe_wal_size_bytes,
+            streamed_transactions: self.stream.as_ref().and_then(|s| s.streamed_transactions()),
         }
     }
 
@@ -557,27 +557,12 @@ impl CdcRuntime {
 /// An embedder reaches this through [`CdcRuntime::write_admin_metrics_prometheus`]; a
 /// process that holds a *snapshot* rather than the live runtime — an admin endpoint
 /// serving a cached scrape, a proxy, `rustcdc-server` — needs the same rendering from the
-/// same input, and used to have its own.
+/// same input.
 ///
-/// Two renderers of one metric surface is the divergence class that produces wrong
-/// answers rather than errors, and it duly produced three:
-///
-/// - **The same signal under two names.** The replication slot lag was
-///   `rustcdc_replication_slot_lag_bytes` here and
-///   `rustcdc_runtime_replication_slot_lag_bytes` there. That is the most operationally
-///   critical PostgreSQL signal the project emits — an unbounded slot ends in a full
-///   `pg_wal` volume — and the shipped alert rules referenced *both*, so one of the two
-///   could never fire.
-/// - **Families missing entirely.** `rustcdc_runtime_idempotency_evictions_total` and
-///   `rustcdc_runtime_idempotency_unidentifiable_total` existed only here, so a server
-///   deployment exported neither — while the runbook told operators to alert on the
-///   first, whose growth means the dedup window is too small and older duplicates have
-///   silently stopped being suppressed.
-/// - **Different label sets.** Everything here carries `source_type`; the other renderer
-///   emitted none, so a dashboard or alert written against one did not port to the other.
-///
-/// The fix is structural rather than a test asserting two implementations agree: there is
-/// one implementation, so they cannot.
+/// Two renderers of one metric surface diverge into wrong answers rather than errors: one
+/// signal under two names (so one of two alert rules never fires), families missing from
+/// one surface, label sets that do not port between dashboards. There is one
+/// implementation, so they cannot disagree.
 pub fn write_runtime_metrics_prometheus<W: std::io::Write>(
     admin: &RuntimeAdminSnapshot,
     w: &mut W,
@@ -818,6 +803,20 @@ pub fn write_runtime_metrics_prometheus<W: std::io::Write>(
                 "# HELP rustcdc_replication_slot_safe_wal_size_bytes PostgreSQL replication slot safe_wal_size: bytes of WAL that can still be written before the slot is endangered. Negative once the slot is unreserved; absent when max_slot_wal_keep_size is unlimited.\n\
                  # TYPE rustcdc_replication_slot_safe_wal_size_bytes gauge\n\
                  rustcdc_replication_slot_safe_wal_size_bytes{{source_type=\"{source_type}\"}} {safe_bytes}"
+            )?;
+        }
+
+        if let Some(streamed) = &admin.streamed_transactions {
+            writeln!(
+                w,
+                "# HELP rustcdc_streamed_transactions_open Transactions the source is streaming before their commit; their rows are released at the commit.\n\
+                 # TYPE rustcdc_streamed_transactions_open gauge\n\
+                 rustcdc_streamed_transactions_open{{source_type=\"{source_type}\"}} {}\n\
+                 # HELP rustcdc_streamed_transaction_bytes Bytes held for streamed transactions not yet committed, in memory or in spill files.\n\
+                 # TYPE rustcdc_streamed_transaction_bytes gauge\n\
+                 rustcdc_streamed_transaction_bytes{{source_type=\"{source_type}\",store=\"memory\"}} {}\n\
+                 rustcdc_streamed_transaction_bytes{{source_type=\"{source_type}\",store=\"disk\"}} {}",
+                streamed.open, streamed.bytes_in_memory, streamed.bytes_on_disk
             )?;
         }
 

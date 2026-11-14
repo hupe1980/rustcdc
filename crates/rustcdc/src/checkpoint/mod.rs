@@ -707,9 +707,9 @@ impl FileCheckpointInner {
     ///
     /// Acquiring the lease once is not the same as holding it: an operator can delete
     /// the sentinel file to clear what looks like a stuck lease, and a peer that saw
-    /// this process as dead can take it over. Both cases used to leave two writers
-    /// against one directory, each advancing the checkpoint from its own view of
-    /// progress — which is how a checkpoint silently regresses or jumps forward.
+    /// this process as dead can take it over. Either leaves two writers against one
+    /// directory, each advancing the checkpoint from its own view of progress — which is
+    /// how a checkpoint silently regresses or jumps forward.
     fn verify_lease_still_held(&self) -> Result<()> {
         if self.read_only {
             return Err(crate::core::Error::CheckpointError(format!(
@@ -2049,8 +2049,7 @@ mod tests {
         // The count-based check cannot see this: the pipeline keeps committing events,
         // so `committed_event_count` keeps rising while the recorded resume point moves
         // *behind* data the sink has already accepted. That is what a connector defect
-        // looks like from the checkpoint layer, and it used to be written without
-        // complaint.
+        // looks like from the checkpoint layer.
         let dir = tempdir().unwrap();
         let mut checkpoint = FileCheckpoint::new(dir.path());
 
@@ -2289,10 +2288,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_file_checkpoint_on_the_same_directory_is_refused() {
-        // This test previously asserted that a second `FileCheckpoint` on the same
-        // directory worked ("re-entrant lease"). It did — and that is exactly how two
-        // instances silently overwrote each other's records, because each holds its
-        // own lease state and rewrites the whole file. One instance per directory.
+        // One instance per directory: each holds its own lease state and rewrites the
+        // whole file, so two instances would silently overwrite each other's records.
         let dir = tempdir().unwrap();
         let mut writer = FileCheckpoint::new(dir.path());
 

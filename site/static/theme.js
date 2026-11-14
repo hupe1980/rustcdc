@@ -19,6 +19,47 @@
       var next = current === "dark" ? "light" : "dark";
       root.dataset.theme = next;
       try { localStorage.setItem("theme", next); } catch (e) {}
+      followTheme();
+    });
+  }
+
+  // ── Screenshots follow the chosen theme ────────────────────────────────────
+  // A <picture>'s dark source asks the OS, not the toggle. Pin it to the explicit choice, so a
+  // reader who switched themes sees the screenshots they switched to.
+  function followTheme() {
+    var chosen = document.documentElement.dataset.theme;
+    document.querySelectorAll("picture source[data-theme-media], picture source[media*='prefers-color-scheme']").forEach(function (source) {
+      if (!source.dataset.themeMedia) source.dataset.themeMedia = source.media;
+      source.media = !chosen ? source.dataset.themeMedia : chosen === "dark" ? "all" : "not all";
+    });
+  }
+  followTheme();
+
+  // ── Screenshots open full size ─────────────────────────────────────────────
+  // The image as shown — the theme's variant — in a <dialog>: Escape, a click or the button
+  // closes it, and focus returns where it was.
+  var shots = document.querySelectorAll(".prose picture img, .prose img.zoomable");
+  if (shots.length && typeof HTMLDialogElement === "function") {
+    var dialog = document.createElement("dialog");
+    dialog.className = "lightbox";
+    dialog.innerHTML = '<button type="button" class="lightbox-close" aria-label="Close">×</button><img alt="">';
+    document.body.appendChild(dialog);
+    var big = dialog.querySelector("img");
+    dialog.addEventListener("click", function () { dialog.close(); });
+    shots.forEach(function (img) {
+      img.classList.add("is-zoomable");
+      img.tabIndex = 0;
+      img.setAttribute("role", "button");
+      img.setAttribute("aria-label", (img.alt || "Screenshot") + " — open full size");
+      var open = function () {
+        big.src = img.currentSrc || img.src;
+        big.alt = img.alt;
+        dialog.showModal();
+      };
+      img.addEventListener("click", open);
+      img.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }
+      });
     });
   }
 

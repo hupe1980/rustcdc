@@ -10,9 +10,7 @@
 //! `runtime_mysql_process_crash_integration.rs`, `runtime_mariadb_process_crash_integration.rs`
 //! and `runtime_sqlserver_process_crash_integration.rs` spawn a child process against a live
 //! database, kill it mid-stream, and assert on recovery from the checkpoint it left behind.
-//!
-//! This file was previously named `crash_simulation_integration.rs`, which read as though it
-//! were one of those. It is not, and the audit flagged the name as misleading evidence.
+//! This file is not one of those.
 
 use rustcdc::{
     Event, Operation, SourceMetadata, StructuredLogger,

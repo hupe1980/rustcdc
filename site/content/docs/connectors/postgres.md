@@ -48,18 +48,26 @@ When `snapshot_tables` is configured (top-level in `cdc.toml`, or via
 `rustcdc run --snapshot-table schema.table`), the connector performs an initial
 snapshot before streaming:
 
-1. Opens a consistent `REPEATABLE READ` transaction
-2. Records the current WAL LSN as the snapshot boundary
-3. Performs a full table scan for each table in `snapshot_tables`, emitting
-   one `read` event per row
-4. Commits the transaction and records the snapshot LSN as the checkpoint
-5. Switches to streaming mode from that LSN (snapshot-to-stream handoff)
+1. Opens a second connection, the **anchor**, whose `REPEATABLE READ` transaction reads the
+   current WAL LSN — the snapshot boundary — and exports its snapshot, in one statement
+2. Reads each table in `snapshot_tables` by primary-key keyset in a transaction that imports
+   that snapshot, emitting one `read` event per row
+3. Switches to streaming mode from the boundary LSN (snapshot-to-stream handoff)
+
+**The snapshot is one point in time, failures included.** A chunk that fails part-way rolls its
+transaction back; the next one imports the same exported snapshot, so a row written since the
+snapshot began is never read by it — it reaches the consumer once, through the stream. This holds
+while the anchor lives: it costs one connection for the length of the snapshot, and like any
+snapshot it holds back `xmin`, so vacuum cannot reclaim rows changed since it began. If the anchor
+cannot be opened or is ended — `idle_in_transaction_session_timeout` is the usual cause, so leave
+it unset for the CDC role — the snapshot continues in a new transaction at a later point and logs
+a WARN: a row written in between may then arrive both as a snapshot read and as a stream change.
 
 Without `snapshot_tables`, the connector starts streaming immediately from the
 slot position — existing rows are not re-read.
 
-If the connector is interrupted during the snapshot, it restarts the snapshot
-from the beginning. Only a fully completed snapshot advances the checkpoint.
+**A restart resumes the snapshot** from the checkpoint at each table's keyset cursor, with the
+original boundary LSN; the rows still to read are read as they are at the restart.
 
 ### Incremental snapshot (non-blocking)
 
@@ -73,7 +81,8 @@ chunk_size = 5000
 ```
 
 Streaming starts immediately, and each chunk is a keyset-paginated `SELECT`
-bracketed by low/high watermarks written into the WAL. Rows the stream also
+bracketed by low/high watermarks read from `pg_current_wal_lsn()` — nothing is
+written to the source. Rows the stream also
 delivered inside the override window are reconciled by row identity, so a row
 changed mid-chunk is not delivered twice with stale content.
 
@@ -97,7 +106,8 @@ After the snapshot, the connector streams changes by reading from the replicatio
 slot:
 
 - Each committed transaction's WAL records are decoded by `pgoutput` and
-  forwarded to the connector
+  forwarded to the connector; a large one arrives while it runs (see
+  [Large transactions](#large-transactions))
 - The connector converts them into the rustcdc event envelope (see
   [event model](@/docs/concepts.md#1-event-model))
 - After a batch is delivered to the sink, the connector acknowledges the LSN to
@@ -147,6 +157,50 @@ wal_transport = "streaming_replication"   # or "sql_peek"
 > `transport.mode = "tls"` against a server with `ssl = off` fails to connect instead
 > of silently falling back to an unencrypted connection. Either enable TLS on the
 > server or set `mode = "plaintext"` explicitly.
+
+### Large transactions
+
+On PostgreSQL 14 and later the connector asks for pgoutput protocol version 2 with
+`streaming 'on'`. A transaction that grows past the server's `logical_decoding_work_mem`
+(64 MB by default) is then **streamed while it runs**, instead of being spilled to
+`pg_replslot/` on the primary's disk and sent as one burst after its commit.
+
+**Nothing is released before the commit.** The connector holds a streamed transaction until
+PostgreSQL commits it, drops it if it rolls back, and drops a savepoint's rows on
+`ROLLBACK TO SAVEPOINT`. A sink receives exactly what it would receive without streaming, and
+the checkpoint never moves for a transaction that has not committed.
+
+| | Without streaming (v1) | With streaming (v2, the default) |
+|---|---|---|
+| While a 10 M-row `UPDATE` runs | The primary spills it to its own disk | The primary sends it; the connector holds it |
+| At its commit | The whole transaction crosses the network | Only the rest crosses |
+| 300 000 updates, last row at Kafka ([measured](@/docs/performance.md)) | +13.1 s after the commit | +10.4 s |
+| `pg_stat_replication_slots` | `spill_txns`, `spill_bytes` grow | `stream_txns`, `stream_bytes` grow |
+
+**Where it is held.** In memory up to `stream_buffer_memory_bytes` (64 MiB) across open
+transactions; a transaction that would cross that moves to a file in `stream_spill_directory`
+(the system temporary directory by default). The operating system deletes a spill file
+when it is closed, so a crash leaves nothing behind, and the slot streams the transaction again after a
+restart. The directory is checked writable when the stream opens; under a read-only root
+filesystem, mount an `emptyDir` and point `stream_spill_directory` at it. A full disk stops the
+pipeline with the I/O error; nothing is dropped.
+
+**The limit that does not change.** A committed transaction is still delivered as one unit, so
+its events are held in memory while they are, with or without streaming.
+
+**What you see meanwhile.** `/status` names the transaction under `source.open_transaction` —
+changes so far, bytes, on disk or not, since when — and the [console](@/docs/console.md) says
+*Reading a transaction in progress*. `rustcdc_streamed_transactions_open` and
+`rustcdc_streamed_transaction_bytes{store="memory"|"disk"}` are the gauges.
+
+<picture>
+  <source srcset="../../../console/streaming-health-dark.webp" media="(prefers-color-scheme: dark)">
+  <img src="../../../console/streaming-health-light.webp" alt="A transaction streaming in before its commit: 2.1M changes so far, open for 4 min, 1.3 GB held on disk" width="1280" height="800" loading="lazy">
+</picture>
+
+**Turning it off.** `stream_in_progress_transactions = false` asks for v1. `sql_peek` always
+uses v1: a peek can stop part-way through a stream and the next one starts it over, so a stream
+longer than one poll would never reach its commit.
 
 ### Offset / LSN
 
@@ -576,6 +630,11 @@ slot_idle_advance_interval_ms      = 30000   # idle slot advance; 0 disables (no
 # WAL transport
 wal_transport = "streaming_replication"   # streaming_replication | sql_peek
 
+# Large transactions (PostgreSQL 14+, streaming_replication)
+stream_in_progress_transactions = true    # false asks for pgoutput v1
+stream_buffer_memory_bytes      = 67108864
+# stream_spill_directory        = "/var/lib/rustcdc/spill"   # defaults to the system temp dir
+
 # Polling
 stream_poll_interval_ms = 100
 max_events_per_poll     = 1000
@@ -607,6 +666,9 @@ mode = "plaintext"    # plaintext | tls
 | `slot_idle_advance_interval_ms` | `30000` | Advance the slot when no committed events arrive so PostgreSQL can recycle WAL. `0` disables (not recommended for long-lived streams) |
 | `slot_state_sample_interval_ms` | unset | How often to sample the slot's lag and `wal_status`. Unset follows `slot_idle_advance_interval_ms`, or 15 s when that is `0`. Must be greater than zero when set |
 | `wal_transport` | `"streaming_replication"` | How the WAL stream is read. `"sql_peek"` is the fallback for a role without `REPLICATION` or a connection that must route through a pooler — see [WAL transport](#wal-transport-how-the-stream-is-read) for the cost |
+| `stream_in_progress_transactions` | `true` | Stream large transactions while they run (pgoutput v2, PostgreSQL 14+). Rows are still released at the commit — see [Large transactions](#large-transactions) |
+| `stream_buffer_memory_bytes` | `67108864` | Memory for streamed transactions not yet committed; past it a transaction spills to disk |
+| `stream_spill_directory` | system temp dir | Where streamed transactions spill; must be writable |
 | `conn_timeout_secs` | `30` | Connection timeout in seconds |
 | `stream_poll_interval_ms` | `50` | Stream poll interval; under `streaming_replication` the server pushes, so this bounds the idle backstop rather than delivery latency |
 | `max_events_per_poll` | `1000` | Maximum events yielded per poll cycle |

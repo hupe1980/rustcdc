@@ -19,12 +19,11 @@ pub(super) struct TableSnapshotState {
     pub(super) live_query: bool,
     /// Schema (database) the table was resolved under, and the bare table name.
     ///
-    /// Snapshot events used to carry `schema: None` and the *configured* table string, so
-    /// one physical table was `"app.users"` during the snapshot and `"users"` with
-    /// `schema: Some("app")` during streaming — a router configured for one silently
-    /// received nothing from the other phase. PostgreSQL fixed this in its own snapshot
-    /// path; MySQL kept the mismatch. Carrying both halves here is what lets the two
-    /// phases emit one identity.
+    /// Carrying both halves lets snapshot and streaming emit one identity. With
+    /// `schema: None` and the *configured* table string, one physical table would be
+    /// `"app.users"` during the snapshot and `"users"` with `schema: Some("app")` during
+    /// streaming — a router configured for one would silently receive nothing from the
+    /// other phase.
     pub(super) schema_name: String,
     /// The bare table name, without the schema qualifier.
     pub(super) bare_table: String,

@@ -153,8 +153,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
       # Compiles every Rust block in README.md and docs/*.md as well as the rustdoc
-      # examples. Published samples that no longer compile are integration failures
-      # waiting to happen; before this ran, 36 of 96 documented samples were broken.
+      # examples, so a published sample that no longer compiles fails CI.
       # See `markdown_doctests` in src/lib.rs.
       - name: cargo test -p rustcdc --doc --all-features (rustdoc + Markdown samples)
         run: cargo test -p rustcdc --doc --all-features
@@ -397,6 +396,7 @@ jobs:
           - postgres_version_matrix
           - postgres_snapshot_integration
           - postgres_stream_integration
+          - postgres_streaming_integration
           # Reselecting unchanged TOASTed values. Both halves of the claim run against one
           # live server: the default must report the hole, and only then does filling it
           # prove anything — a suite asserting only the filled half would pass just as well
@@ -462,9 +462,8 @@ jobs:
         if: matrix.suite != 'runtime_postgres_process_crash_integration' && matrix.suite != 'otel_metrics_integration' && matrix.suite != 'otel_tracing_integration' && matrix.suite != 'example_pg_to_stdout'
         run: cargo test -p rustcdc --test ${{ matrix.suite }} --features postgres
       # The test builds the example itself (`cargo build --example pg_to_stdout`) before spawning
-      # it, so no extra target selection is needed. It used to pass `--examples --tests`, and
-      # `--tests` selects *every* test target — so this matrix entry ran the whole integration
-      # suite and reported unrelated failures under this job's name.
+      # it, so no extra target selection is needed. Do not add `--tests`: it selects *every*
+      # test target, and this entry would run the whole integration suite under its name.
       - name: cargo test -p rustcdc --test example_pg_to_stdout
         if: matrix.suite == 'example_pg_to_stdout'
         run: cargo test -p rustcdc --test example_pg_to_stdout --features postgres
@@ -678,9 +677,8 @@ jobs:
         if: matrix.suite != 'runtime_sqlserver_process_crash_integration' && matrix.suite != 'sqlserver_to_otel_example_integration'
         run: cargo test -p rustcdc --test ${{ matrix.suite }} --features sqlserver
       # The test builds the example itself (`cargo build --example sqlserver_to_otel`) before
-      # spawning it, so no extra target selection is needed here. It used to pass
-      # `--examples --tests`, and `--tests` selects *every* test target — so this matrix entry ran
-      # the whole integration suite, and a PostgreSQL failure was reported as a SQL Server one.
+      # spawning it, so no extra target selection is needed here. Do not add `--tests`: it
+      # selects *every* test target, and a PostgreSQL failure would be reported as a SQL Server one.
       - name: cargo test -p rustcdc --test sqlserver_to_otel_example_integration
         if: matrix.suite == 'sqlserver_to_otel_example_integration'
         run: cargo test -p rustcdc --test sqlserver_to_otel_example_integration --features sqlserver,metrics
@@ -1018,12 +1016,32 @@ jobs:
           RUSTCDC_INTEGRATION: "1"
           RUSTCDC_TEST_BROKER: ${{ matrix.broker }}
         run: cargo test -p rustcdc-server --all-features --locked --test ${{ matrix.suite }} -- --test-threads=1
-      # Removes the container **this** job started. It used to remove
-      # `rustcdc-integration-postgres` unconditionally, so the MySQL job cleaned up a
-      # container it had never started and left its own running.
+      # Removes the container **this** job started, not a fixed name: otherwise one broker's
+      # job removes a container it never started and leaves its own running.
       - name: Clean up the container
         if: always()
         run: docker rm -f ${{ matrix.container }} || true
+
+  # ── The pipeline, end to end ───────────────────────────────────────────────
+  #
+  # PostgreSQL → the `rustcdc` binary → Apache Kafka, under both delivery contracts, read back
+  # with a `read_committed` consumer for `effectively_once`. It fails on a row that never
+  # arrives and, under `effectively_once`, on a row that arrives twice. Each layer has its own
+  # suite; this is the only job that composes them, so a defect between layers surfaces here.
+  # The card it prints is not a measurement — `cargo xtask pipeline-bench` without `--smoke`
+  # measures, locally.
+  server-pipeline-smoke:
+    name: "server: pipeline end to end (both contracts)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/build-deps
+      - run: cargo xtask pipeline-bench --smoke
+      - name: Clean up the containers
+        if: always()
+        run: docker rm -f rustcdc-bench-postgres rustcdc-bench-kafka || true
 
   # ── Fuzz targets (build + short smoke run) ──────────────────────────────────
   #
@@ -1104,6 +1122,7 @@ jobs:
       - server-connector-matrix
       - server-test
       - server-integration
+      - server-pipeline-smoke
       - server-fuzz
     runs-on: ubuntu-latest
     steps:
