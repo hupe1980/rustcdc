@@ -680,7 +680,7 @@ async fn runtime_postgres_process_kill_mid_stream_loses_no_committed_row() -> ru
 /// The worker acknowledges its first batch, 256 events of a 3,000-row transaction, and is
 /// killed. That acknowledgement checkpoints and confirms the slot, so the position it
 /// writes decides what a restart can still read: at the transaction's end, the remaining
-/// 2,744 rows are gone for good (#43); before its BEGIN, PostgreSQL resends all of it.
+/// 2,744 rows are gone for good; before its BEGIN, PostgreSQL resends all of it.
 #[tokio::test]
 async fn runtime_postgres_process_kill_after_the_first_batch_of_a_large_transaction_loses_no_row()
 -> rustcdc::Result<()> {

@@ -196,7 +196,7 @@ nothing. Set `checkpoint_interval_ms = 0` to write per batch, at a throughput co
 |---|---|
 | Batch atomicity at the sink | **guaranteed** — all of a batch commits, or none |
 | Duplicates during steady-state retries | impossible |
-| Duplicates after a crash | impossible |
+| Duplicates after a crash | impossible for a transaction delivered in one batch. One delivered in several (`transaction_boundary = "split"`, or larger than `max_buffer_size` under either policy) replays from its start, so its batches already committed arrive twice |
 | Data gaps | impossible |
 | Compatible sinks | Kafka (transactional), or Snowflake |
 

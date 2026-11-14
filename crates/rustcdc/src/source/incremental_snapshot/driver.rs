@@ -1546,7 +1546,7 @@ impl<B: IncrementalSnapshotBackend + 'static> StreamHandle for IncrementalSnapsh
 
     /// Only the inner stream knows its transaction boundaries. Without this the runtime
     /// falls back to each event's own position, so the same events would checkpoint
-    /// differently with and without an incremental snapshot configured (#43).
+    /// differently with and without an incremental snapshot configured.
     fn resume_offset_for(&self, event: &Event) -> Option<String> {
         self.inner.resume_offset_for(event)
     }
@@ -1703,7 +1703,7 @@ mod tests {
     /// Where a stream event resumes from is the inner stream's answer: only it knows the
     /// transaction boundaries. A wrapper that does not forward it leaves the runtime on the
     /// event's own change position, so the same events checkpoint differently with and
-    /// without an incremental snapshot configured (#43).
+    /// without an incremental snapshot configured.
     #[tokio::test]
     async fn the_driver_forwards_its_inner_streams_resume_offset() {
         let driver = driver_resuming_from(Vec::new(), None, 10).await;
