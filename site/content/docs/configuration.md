@@ -1225,7 +1225,7 @@ backend, and the guarantees differ:
 
 | Backend | Mechanism | Strength |
 |---|---|---|
-| `local_fs` | An advisory lock held for the process's lifetime, plus a TTL owner lease renewed on a timer | Strongest on a local path: a second process is refused and a crashed owner is replaced at once. On a shared path the lease decides; see below |
+| `local_fs` | An advisory lock held for the process's lifetime, plus a TTL owner lease renewed on a timer | Strongest on a local path: a second process is refused and a crashed owner is replaced at once. Otherwise the lease decides; see below |
 | `kafka_topic` | Kafka transactional id + `init_transactions()` (KIP-447) | **Strongest.** The broker fences the previous producer by epoch. No TTL, no race |
 | `redis`, `postgresql` | TTL owner lease beside the checkpoint, renewed on a heartbeat and re-verified before each write | Good. Closes the rolling-update overlap; see the caveat below |
 
@@ -1238,19 +1238,22 @@ no manual step.
 when the process exits, however it exits.
 
 - **On a local path the lock decides.** A second process that cannot take it is refused,
-  even if the owner is idle and its lease looks old. One that can take it, finding a live
-  lease written on the same kernel (the same `/proc/sys/kernel/random/boot_id`, which every
-  container on a host shares), replaces the crashed owner at once. This holds whatever the
-  PIDs are, so a container restarted after a crash (PID 1 before and after) starts
-  immediately, and it needs no external program.
-- **On a shared or network path the lease decides.** An owner on another kernel may hold a
-  lock this one is never told about, so its live lease is authoritative until it expires:
-  a crashed owner on another host blocks a successor for up to 60 s. The lease is renewed on
-  a timer, so an idle owner keeps it.
-- *Limits:* off Linux there is no boot id, and a lease written by a version without one is
-  judged by its TTL alone, as is every lease where the filesystem refuses advisory locks
-  (logged as a warning). The lock is advisory: it does not stop another program from writing
-  the directory.
+  even if the owner is idle and its lease looks old. The owner records in its lease where
+  its lock is visible: the kernel (`/proc/sys/kernel/random/boot_id`, which every container
+  on a host shares) and the filesystem's device number. A process that takes the lock and
+  finds a live lease recorded in that same place replaces the crashed owner at once. This
+  holds whatever the PIDs are, so a container restarted after a crash (PID 1 before and
+  after) starts immediately, and it needs no external program.
+- **Otherwise the lease decides.** An owner on another kernel, or one that locked through
+  another mount of a network directory, may hold a lock this process is never told about,
+  so its live lease is authoritative until it expires: a crashed owner there blocks a
+  successor for up to 60 s. The same holds for an owner whose filesystem refused the lock
+  (logged as a warning): its lease records no lock. The lease is renewed on a timer, so an
+  idle owner keeps it.
+- *Limits:* off Linux there is no boot id, and a lease written by a version that does not
+  record the lock's place is judged by its TTL once, at upgrade. The immediate takeover
+  assumes that two openers on one kernel that see one device number share its locks. The
+  lock is advisory: it does not stop another program from writing the directory.
 
 **Caveat for `redis` / `postgresql`:** acquisition is read-then-write, not
 compare-and-swap, because OpenDAL exposes no uniform CAS across those services. Two

@@ -46,6 +46,45 @@ pub(crate) fn try_lock(path: &Path) -> Result<TryLock, AppError> {
     }
 }
 
+/// Where a lock held on a file is visible: one kernel's lock table for one filesystem.
+///
+/// Two openers on one kernel that see the same device share that filesystem's locks, so if
+/// one of them can take a lock the other held, the other no longer holds it. A different
+/// kernel, or a different mount of a network directory, is a different device or a
+/// different boot id, and proves nothing either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LockDomain {
+    /// `/proc/sys/kernel/random/boot_id`: shared by every container on a host, distinct
+    /// across hosts and reboots.
+    pub(crate) boot_id: String,
+    /// The device of the filesystem the lock file lives on.
+    pub(crate) dev: u64,
+}
+
+/// The domain of a lock held on `file`; `None` where the platform does not expose a boot id
+/// or a device number.
+pub(crate) fn lock_domain(file: &File) -> Option<LockDomain> {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())?;
+    Some(LockDomain {
+        boot_id,
+        dev: device_of(file)?,
+    })
+}
+
+#[cfg(unix)]
+fn device_of(file: &File) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    file.metadata().ok().map(|metadata| metadata.dev())
+}
+
+#[cfg(not(unix))]
+fn device_of(_: &File) -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

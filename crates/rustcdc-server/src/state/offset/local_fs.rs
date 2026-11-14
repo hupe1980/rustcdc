@@ -10,7 +10,7 @@ use rustcdc::core::{Error as RtError, Offset};
 use crate::error::AppError;
 
 use crate::state::CheckpointAgeSource;
-use crate::state::file_lock::{self, TryLock};
+use crate::state::file_lock::{self, LockDomain, TryLock};
 use crate::state::remote_lease::{self, LEASE_HEARTBEAT, LEASE_TTL, LeaseRecord};
 
 /// The owner lease file, beside the checkpoint it protects.
@@ -43,13 +43,14 @@ const OWNER_LOCK_FILE: &str = "owner_lease.lock";
 /// The owner holds an advisory lock on [`OWNER_LOCK_FILE`] for as long as it runs. The
 /// kernel releases it when the owner exits, however it exits, so on a local filesystem the
 /// lock answers "is the owner alive" outright: a second instance that cannot take it is
-/// refused, and one that can, finding a live lease written **on this kernel** (same
-/// [`remote_lease::boot_id`]), is looking at a crash and takes over at once. That holds
-/// whatever the PIDs are — in a container the crashed owner and its successor are both
-/// PID 1 — and needs no external program.
+/// refused, and one that can, finding a live lease whose owner held the lock **in the same
+/// [`LockDomain`]** (this kernel, this filesystem device), is looking at a crash and takes
+/// over at once. That holds whatever the PIDs are — in a container the crashed owner and
+/// its successor are both PID 1 — and needs no external program.
 ///
-/// The lease covers what the lock cannot see: an owner on another kernel, which on a
-/// shared or network path may hold a lock this one is never told about. There the lease is
+/// The lease covers what the lock cannot see: an owner on another kernel or another mount,
+/// which on a shared or network path may hold a lock this one is never told about, and an
+/// owner that could not lock at all. There the lease is
 /// authoritative, with the same contract as [`crate::state::remote_lease`]: one record
 /// type, one TTL, one heartbeat, one conflict message. A crashed owner's lease expires by
 /// itself after `LEASE_TTL`; the owner renews it on a timer so an idle pipeline keeps it;
@@ -67,7 +68,8 @@ pub(crate) struct OwnedStateDir {
     path: PathBuf,
     owner: String,
     epoch: u64,
-    boot_id: Option<String>,
+    /// Where our lock is visible; `None` without a lock, so our lease never claims one.
+    domain: Option<LockDomain>,
     last_renewed_ms: AtomicU64,
     /// The advisory lock, held until [`release`](Self::release) or drop. `None` when the
     /// filesystem refused to lock; the lease alone decides then.
@@ -101,7 +103,8 @@ impl OwnedStateDir {
                 owner: self.owner.clone(),
                 renewed_at_ms: now_ms,
                 epoch: self.epoch,
-                boot_id: self.boot_id.clone(),
+                boot_id: self.domain.as_ref().map(|d| d.boot_id.clone()),
+                lock_dev: self.domain.as_ref().map(|d| d.dev),
             },
         )?;
         self.last_renewed_ms.store(now_ms, Ordering::Relaxed);
@@ -206,12 +209,20 @@ fn write_lease(path: &Path, record: &LeaseRecord) -> Result<(), AppError> {
 
 /// Take ownership of a `local_fs` state directory, refusing if a live owner holds it.
 pub(crate) fn acquire_state_dir(state_dir: &Path) -> Result<Arc<OwnedStateDir>, AppError> {
+    acquire_with(state_dir, file_lock::try_lock)
+}
+
+/// [`acquire_state_dir`] with the lock attempt supplied, so a test can stand in a
+/// filesystem that refuses locks.
+fn acquire_with(
+    state_dir: &Path,
+    try_lock: impl FnOnce(&Path) -> Result<TryLock, AppError>,
+) -> Result<Arc<OwnedStateDir>, AppError> {
     let path = state_dir.join(OWNER_LEASE_FILE);
     let lock_path = state_dir.join(OWNER_LOCK_FILE);
     let now_ms = remote_lease::now_unix_ms();
-    let boot_id = remote_lease::boot_id();
 
-    let lock = match file_lock::try_lock(&lock_path)? {
+    let lock = match try_lock(&lock_path)? {
         TryLock::Held(file) => Some(file),
         // A live owner holds the lock. Refused whatever its lease says: an idle owner whose
         // lease looks expired is still running.
@@ -240,17 +251,19 @@ pub(crate) fn acquire_state_dir(state_dir: &Path) -> Result<Arc<OwnedStateDir>, 
         }
     };
 
+    let domain = lock.as_ref().and_then(file_lock::lock_domain);
     let existing = read_lease(&path)?;
     let epoch = match &existing {
-        // We hold the lock, and the lease was written on this kernel: its owner would hold
-        // the lock if it were running, so it has exited — a crash, not a conflict. Waiting
-        // out the TTL here would refuse a restart by systemd or a container runtime for a
-        // full minute, for a directory nobody holds.
+        // We hold the lock, and the lease's owner held it in the same domain: it would
+        // still hold it if it were running, so it has exited — a crash, not a conflict.
+        // Waiting out the TTL here would refuse a restart by systemd or a container runtime
+        // for a full minute, for a directory nobody holds.
         Some(record)
             if record.is_live(now_ms, LEASE_TTL)
-                && lock.is_some()
-                && boot_id.is_some()
-                && record.boot_id == boot_id =>
+                && domain.as_ref().is_some_and(|ours| {
+                    record.boot_id.as_deref() == Some(ours.boot_id.as_str())
+                        && record.lock_dev == Some(ours.dev)
+                }) =>
         {
             tracing::warn!(
                 previous_owner = %record.owner,
@@ -260,8 +273,9 @@ pub(crate) fn acquire_state_dir(state_dir: &Path) -> Result<Arc<OwnedStateDir>, 
             );
             record.epoch.saturating_add(1)
         }
-        // Another kernel's owner, or one we cannot place: on a shared or network path its
-        // lock may be invisible here, so its lease is authoritative until it expires.
+        // An owner in another domain, one that held no lock, or one we cannot place: its
+        // lock, if any, may be invisible here, so its lease is authoritative until it
+        // expires.
         Some(record) if record.is_live(now_ms, LEASE_TTL) => {
             return Err(remote_lease::conflict_error("local_fs", record, now_ms));
         }
@@ -283,7 +297,8 @@ pub(crate) fn acquire_state_dir(state_dir: &Path) -> Result<Arc<OwnedStateDir>, 
             owner: owner.clone(),
             renewed_at_ms: now_ms,
             epoch,
-            boot_id: boot_id.clone(),
+            boot_id: domain.as_ref().map(|d| d.boot_id.clone()),
+            lock_dev: domain.as_ref().map(|d| d.dev),
         },
     )?;
 
@@ -293,7 +308,7 @@ pub(crate) fn acquire_state_dir(state_dir: &Path) -> Result<Arc<OwnedStateDir>, 
         path,
         owner,
         epoch,
-        boot_id,
+        domain,
         last_renewed_ms: AtomicU64::new(now_ms),
         lock: std::sync::Mutex::new(lock),
     }))
@@ -532,6 +547,7 @@ mod lease_tests {
                 renewed_at_ms: stale,
                 epoch: 7,
                 boot_id: None,
+                lock_dev: None,
             },
         )
         .expect("seed a stale lease");
@@ -568,6 +584,7 @@ mod lease_tests {
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: owner.epoch + 1,
                 boot_id: None,
+                lock_dev: None,
             },
         )
         .expect("successor takes the lease");
@@ -603,6 +620,7 @@ mod lease_tests {
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 99,
                 boot_id: None,
+                lock_dev: None,
             },
         )
         .expect("successor takes the lease");
@@ -638,6 +656,7 @@ mod lease_tests {
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 3,
                 boot_id: Some(boot_id),
+                lock_dev: Some(this_lock_dev(dir.path())),
             },
         )
         .expect("seed a fresh lease from a crashed owner");
@@ -666,6 +685,7 @@ mod lease_tests {
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 1,
                 boot_id: None,
+                lock_dev: None,
             },
         )
         .expect("seed a live lease");
@@ -695,6 +715,7 @@ mod lease_tests {
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 1,
                 boot_id: Some("another-kernel".to_string()),
+                lock_dev: Some(this_lock_dev(dir.path())),
             },
         )
         .expect("seed a live lease from another kernel");
@@ -749,6 +770,7 @@ mod lease_tests {
                 renewed_at_ms: remote_lease::now_unix_ms(),
                 epoch: 1,
                 boot_id: None,
+                lock_dev: None,
             },
         )
         .expect("seed a foreign lease");
@@ -765,6 +787,39 @@ mod lease_tests {
             .ok()
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty())
+    }
+
+    /// The device of the filesystem a test's state directory is on, as the lease records it.
+    fn this_lock_dev(dir: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(dir).expect("state dir").dev()
+    }
+
+    /// A lease from this kernel but another filesystem device is judged by its TTL.
+    ///
+    /// Two mounts of one network directory can each keep their own locks. Our lock on one
+    /// says nothing about an owner that locked through the other, so the boot id alone does
+    /// not decide.
+    #[tokio::test]
+    async fn a_lease_from_this_kernel_on_another_device_is_judged_by_its_ttl() {
+        let (Some(host), Some(boot_id)) = (this_host(), this_boot_id()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_lease(
+            dir.path(),
+            serde_json::json!({
+                "owner": format!("{host}:1:00000000"),
+                "renewed_at_ms": remote_lease::now_unix_ms(),
+                "epoch": 1,
+                "boot_id": boot_id,
+                "lock_dev": this_lock_dev(dir.path()).wrapping_add(1),
+            }),
+        );
+
+        acquire_state_dir(dir.path())
+            .err()
+            .expect("a live lease locked through another device must be refused until it expires");
     }
 
     /// Write a lease as raw JSON, so these tests do not depend on the record's Rust shape.
@@ -794,6 +849,7 @@ mod lease_tests {
                 "renewed_at_ms": remote_lease::now_unix_ms(),
                 "epoch": 5,
                 "boot_id": boot_id,
+                "lock_dev": this_lock_dev(dir.path()),
             }),
         );
 
@@ -891,6 +947,26 @@ mod lease_tests {
             renewed.renewed_at_ms > aged + 1_000,
             "a pipeline's lease must be renewed while it is idle"
         );
+    }
+
+    /// A lease written by an owner that could not lock is never read as "its owner would
+    /// hold the lock".
+    ///
+    /// Locks can fail transiently (`ENOLCK`), so a successor may take the lock that the
+    /// first owner was refused. If the first owner's lease claimed the lock, that successor
+    /// would conclude the owner had crashed and take over a live process.
+    #[tokio::test]
+    async fn a_lease_only_owner_is_not_taken_over_when_locks_work_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = acquire_with(dir.path(), |_| {
+            Ok(TryLock::Unsupported(std::io::Error::other("no locks")))
+        })
+        .expect("an owner on a filesystem that refuses locks");
+
+        acquire_state_dir(dir.path())
+            .err()
+            .expect("an owner that never held the lock must be fenced by its lease");
+        drop(first);
     }
 
     /// An unparseable lease is replaced rather than being fatal.

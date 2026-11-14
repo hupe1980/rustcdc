@@ -62,12 +62,17 @@ pub(crate) struct LeaseRecord {
     /// Monotonic per-acquisition counter, for diagnostics and for a future fencing
     /// token if the store ever grows a CAS primitive.
     pub(crate) epoch: u64,
-    /// The boot id of the kernel the owner ran on, when it is known; see [`boot_id`].
+    /// With [`lock_dev`](Self::lock_dev), where the owner's advisory lock is visible; see
+    /// [`crate::state::file_lock::LockDomain`].
     ///
-    /// Written by the `local_fs` backend only, and absent from a record an older version
-    /// wrote, so it is optional in both directions.
+    /// Written only by a `local_fs` owner that holds its directory's lock, so a successor
+    /// that takes the lock in the same domain knows this owner has exited. Absent from
+    /// every other record, including one an older version wrote, so optional both ways.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) boot_id: Option<String>,
+    /// See [`boot_id`](Self::boot_id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lock_dev: Option<u64>,
 }
 
 impl LeaseRecord {
@@ -83,18 +88,6 @@ impl LeaseRecord {
         }
         now_ms.saturating_sub(self.renewed_at_ms) < ttl.as_millis() as u64
     }
-}
-
-/// The running kernel's boot id, `None` where the platform does not expose one.
-///
-/// Every container on one host reads the same value and every host a different one, which is
-/// exactly the scope of an advisory file lock taken on a local filesystem. A pinned hostname,
-/// by contrast, is shared by containers on different hosts.
-pub(crate) fn boot_id() -> Option<String> {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .ok()
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
 }
 
 /// Identity for this process, stable for its lifetime and distinct from any other.
@@ -209,6 +202,7 @@ mod tests {
             renewed_at_ms: 10_000,
             epoch: 1,
             boot_id: None,
+            lock_dev: None,
         };
         assert!(record.is_live(10_000 + 59_000, LEASE_TTL));
         assert!(!record.is_live(10_000 + 61_000, LEASE_TTL));
@@ -229,6 +223,7 @@ mod tests {
             renewed_at_ms: 100_000,
             epoch: 3,
             boot_id: None,
+            lock_dev: None,
         };
         assert!(record.is_live(90_000, LEASE_TTL));
     }
@@ -297,6 +292,7 @@ mod tests {
             renewed_at_ms: 0,
             epoch: 2,
             boot_id: None,
+            lock_dev: None,
         };
         let message = conflict_error("redis", &record, 5_000).to_string();
         assert!(message.contains("rustcdc-0:7:1234abcd"));
