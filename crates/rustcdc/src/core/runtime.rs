@@ -7344,6 +7344,17 @@ mod tests {
     /// surfacing the transient error to the caller.
     #[tokio::test]
     async fn recoverable_stream_error_triggers_reconnect_and_resumes_delivery() {
+        reconnect_resumes_from_the_acknowledged_position(false).await;
+    }
+
+    /// The same, when the first reconnect attempt fails and the next poll reconnects: the
+    /// position acknowledged before the error is still written before the stream resumes.
+    #[tokio::test]
+    async fn a_reconnect_after_a_failed_connect_resumes_from_the_acknowledged_position() {
+        reconnect_resumes_from_the_acknowledged_position(true).await;
+    }
+
+    async fn reconnect_resumes_from_the_acknowledged_position(fail_first_reconnect: bool) {
         use std::collections::VecDeque;
         use std::sync::atomic::{AtomicU32, Ordering as AOrdering};
 
@@ -7388,6 +7399,7 @@ mod tests {
         // Second stream (after reconnect): 2 events.
         struct ReconnectableSource {
             call_count: Arc<AtomicU32>,
+            connect_failures: Arc<AtomicU32>,
         }
 
         #[async_trait]
@@ -7428,12 +7440,25 @@ mod tests {
             fn source_type(&self) -> &str {
                 "mock"
             }
+
+            async fn connect(&self) -> crate::core::Result<()> {
+                let left = self.connect_failures.load(AOrdering::SeqCst);
+                if left == 0 {
+                    return Ok(());
+                }
+                self.connect_failures.store(left - 1, AOrdering::SeqCst);
+                Err(crate::core::Error::SourceError(
+                    "simulated connection refused".into(),
+                ))
+            }
         }
 
         // ── Setup ─────────────────────────────────────────────────────────
         let call_count = Arc::new(AtomicU32::new(0));
+        let connect_failures = Arc::new(AtomicU32::new(0));
         let source = ReconnectableSource {
             call_count: Arc::clone(&call_count),
+            connect_failures: Arc::clone(&connect_failures),
         };
 
         let checkpoint = InMemoryCheckpoint::default();
@@ -7468,6 +7493,9 @@ mod tests {
             .unwrap();
 
         runtime.start().await.unwrap();
+        if fail_first_reconnect {
+            connect_failures.store(1, AOrdering::SeqCst);
+        }
 
         // ── First poll: delivers 1 event from the first stream ────────────
         let batch1 = runtime.poll_event_batch().await.unwrap();
