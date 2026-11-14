@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -70,19 +69,43 @@ pub(crate) struct OwnedStateDir {
     epoch: u64,
     /// Where our lock is visible; `None` without a lock, so our lease never claims one.
     domain: Option<LockDomain>,
-    last_renewed_ms: AtomicU64,
-    /// The advisory lock, held until [`release`](Self::release) or drop. `None` when the
-    /// filesystem refused to lock; the lease alone decides then.
-    lock: std::sync::Mutex<Option<HeldLock>>,
+    /// One lock over everything that touches the lease, so the renewal timer, a checkpoint
+    /// write and a release never interleave their read, write and rename.
+    state: Mutex<OwnerState>,
+}
+
+struct OwnerState {
+    last_renewed_ms: u64,
+    /// The advisory lock, held until [`release`](OwnedStateDir::release) or drop. `None`
+    /// when the filesystem refused to lock; the lease alone decides then.
+    lock: Option<HeldLock>,
+    /// Set by release: nothing writes the lease after it.
+    released: bool,
 }
 
 impl OwnedStateDir {
+    fn state(&self) -> MutexGuard<'_, OwnerState> {
+        // Every holder leaves the state consistent between statements, so a panic in one
+        // does not stop the release that follows.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Re-assert ownership, failing if another live owner has taken it.
     ///
     /// Losing the lease is terminal by design: an instance that has been fenced out must
     /// stop writing rather than interleave checkpoints with its successor, which is the
     /// failure the lease exists to prevent.
+    #[cfg(test)]
     fn renew(&self) -> Result<(), AppError> {
+        self.renew_locked(&mut self.state())
+    }
+
+    fn renew_locked(&self, state: &mut OwnerState) -> Result<(), AppError> {
+        if state.released {
+            return Err(AppError::Other(
+                "local_fs state lease was released; this instance no longer writes".to_string(),
+            ));
+        }
         let now_ms = remote_lease::now_unix_ms();
 
         if let Some(existing) = read_lease(&self.path)?
@@ -107,7 +130,7 @@ impl OwnedStateDir {
                 lock_dev: self.domain.as_ref().map(|d| d.dev),
             },
         )?;
-        self.last_renewed_ms.store(now_ms, Ordering::Relaxed);
+        state.last_renewed_ms = now_ms;
         Ok(())
     }
 
@@ -117,18 +140,28 @@ impl OwnedStateDir {
     /// refreshing; renewing on every write would put an fsync on the durability path for
     /// no benefit.
     fn renew_if_due(&self) -> Result<(), AppError> {
+        let mut state = self.state();
         let now_ms = remote_lease::now_unix_ms();
-        let last = self.last_renewed_ms.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) < LEASE_HEARTBEAT.as_millis() as u64 {
+        if !state.released
+            && now_ms.saturating_sub(state.last_renewed_ms) < LEASE_HEARTBEAT.as_millis() as u64
+        {
             return Ok(());
         }
-        self.renew()
+        self.renew_locked(&mut state)
     }
 
     /// Release the lock and the lease, so a successor need not wait out the TTL.
+    ///
+    /// The lease goes first, while the lock still keeps a successor out, so the successor
+    /// never finds our lease and refuses.
     pub(crate) fn release(&self) {
-        if let Ok(mut lock) = self.lock.lock()
-            && let Some(lock) = lock.take()
+        let mut state = self.state();
+        if state.released {
+            return;
+        }
+        state.released = true;
+        self.remove_lease();
+        if let Some(lock) = state.lock.take()
             && let Err(error) = lock.release()
         {
             tracing::warn!(
@@ -137,8 +170,11 @@ impl OwnedStateDir {
                  refused until this process exits"
             );
         }
-        // The lease only if we still hold it: a fenced-out instance deleting the file would
-        // hand the directory to a third process while the real owner is still writing.
+    }
+
+    fn remove_lease(&self) {
+        // Only if we still hold it: a fenced-out instance deleting the file would hand the
+        // directory to a third process while the real owner is still writing.
         match read_lease(&self.path) {
             Ok(Some(existing)) if existing.owner != self.owner => return,
             Err(_) => return,
@@ -316,8 +352,11 @@ fn acquire_with(
         owner,
         epoch,
         domain,
-        last_renewed_ms: AtomicU64::new(now_ms),
-        lock: std::sync::Mutex::new(lock),
+        state: Mutex::new(OwnerState {
+            last_renewed_ms: now_ms,
+            lock,
+            released: false,
+        }),
     }))
 }
 
@@ -595,10 +634,8 @@ mod lease_tests {
             },
         )
         .expect("successor takes the lease");
-        owner.last_renewed_ms.store(
-            remote_lease::now_unix_ms() - (LEASE_HEARTBEAT.as_millis() as u64) - 1,
-            Ordering::Relaxed,
-        );
+        owner.state().last_renewed_ms =
+            remote_lease::now_unix_ms() - (LEASE_HEARTBEAT.as_millis() as u64) - 1;
 
         let refused = checkpoint
             .save(&PostgresOffset::new(200, "slot"), 2)
@@ -744,7 +781,7 @@ mod lease_tests {
         let mut lease = read_lease(&path).expect("read").expect("lease");
         lease.renewed_at_ms = aged;
         write_lease(&path, &lease).expect("age the lease");
-        owner.last_renewed_ms.store(0, Ordering::Relaxed);
+        owner.state().last_renewed_ms = 0;
 
         let renewal = spawn_lease_renewal(&owner, std::time::Duration::from_millis(20));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -945,7 +982,7 @@ mod lease_tests {
         let mut lease = read_lease(&path).expect("read").expect("lease");
         lease.renewed_at_ms = aged;
         write_lease(&path, &lease).expect("age the lease");
-        owner.last_renewed_ms.store(0, Ordering::Relaxed);
+        owner.state().last_renewed_ms = 0;
 
         // One heartbeat, with no checkpoint written in between.
         tokio::time::sleep(LEASE_HEARTBEAT + std::time::Duration::from_secs(1)).await;
@@ -976,6 +1013,49 @@ mod lease_tests {
         drop(first);
     }
 
+    /// Several renewals at once — the timer and a checkpoint write — must all succeed
+    /// while the owner holds the directory.
+    #[test]
+    fn concurrent_renewals_all_succeed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = acquire_state_dir(dir.path()).expect("owner");
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let owner = Arc::clone(&owner);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        barrier.wait();
+                        owner.renew().expect("a renewal by the owner must not fail");
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("renewal thread");
+        }
+    }
+
+    /// Once released, the owner writes no lease: a renewal racing shutdown would otherwise
+    /// recreate the lease its release just removed, and hold off a successor for the TTL.
+    #[test]
+    fn a_released_owner_does_not_renew() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let owner = acquire_state_dir(dir.path()).expect("owner");
+        owner.release();
+
+        owner
+            .renew()
+            .expect_err("a released owner must not renew its lease");
+        assert!(
+            read_lease(&dir.path().join(OWNER_LEASE_FILE))
+                .expect("read")
+                .is_none(),
+            "the released lease must stay released"
+        );
+    }
+
     /// A released directory can be taken at once even while this process starts others.
     ///
     /// A child process holds a copy of every open file description from its creation until
@@ -983,7 +1063,7 @@ mod lease_tests {
     /// explicit unlock releases it for every copy.
     #[test]
     fn a_released_directory_is_takeable_at_once_while_processes_spawn() {
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let stop = Arc::new(AtomicBool::new(false));
