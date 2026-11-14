@@ -246,6 +246,7 @@ fn pipeline_smoke(args: &[String]) -> Result<(), String> {
         .env("PIPELINE_BENCH_PER_TXN", "500")
         .env("PIPELINE_BENCH_BULK_ROWS", "0")
         .env("PIPELINE_BENCH_LONG_PASSES", "0")
+        .env("PIPELINE_BENCH_SNAPSHOT_ROWS", "0")
         .current_dir(&root))
 }
 

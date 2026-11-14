@@ -307,7 +307,32 @@ fn contracts() -> Vec<Contract> {
     ]
 }
 
-fn spawn_server(binary: &str, dir: &std::path::Path, contract: &Contract, topic: &str) -> Child {
+/// What one server run reads and where it writes. The contract runs stream `bench` to Kafka;
+/// the snapshot runs read `snap` once, to a file or to Kafka.
+struct Setup {
+    slot: String,
+    table: &'static str,
+    /// The `[sink]` body.
+    sink: String,
+    /// Top-level keys, e.g. `snapshot_tables`.
+    top: String,
+}
+
+impl Setup {
+    fn stream(contract: &Contract, topic: &str) -> Self {
+        Self {
+            slot: format!("bench_{}", contract.name),
+            table: "public.bench",
+            sink: format!(
+                "type = \"kafka\"\nbrokers = \"{}\"\ntopic = \"{topic}\"",
+                broker()
+            ),
+            top: String::new(),
+        }
+    }
+}
+
+fn spawn_server(binary: &str, dir: &std::path::Path, contract: &Contract, setup: &Setup) -> Child {
     let (sink_extra, state_extra) = match contract.extra.split_once("\n\n") {
         Some((sink, state)) => (sink.to_string(), state.to_string()),
         None => (contract.extra.clone(), String::new()),
@@ -315,6 +340,7 @@ fn spawn_server(binary: &str, dir: &std::path::Path, contract: &Contract, topic:
     let config = format!(
         r#"api_version = "v1"
 delivery_contract = "{name}"
+{top}
 
 [source]
 require_primary = false
@@ -325,19 +351,17 @@ port = {PG_PORT}
 user = "cdc"
 password = {{ env = "RUSTCDC_BENCH_PG_PASSWORD" }}
 database = "bench"
-replication_slot_name = "bench_{name}"
+replication_slot_name = "{slot}"
 publication_name = "bench_pub"
 create_replication_slot_if_missing = true
-table_include_list = ["public.bench"]
+table_include_list = ["{table}"]
 {postgres}
 
 [source.postgres.transport]
 mode = "plaintext"
 
 [sink]
-type = "kafka"
-brokers = "{broker}"
-topic = "{topic}"
+{sink}
 {sink_extra}
 
 [state]
@@ -351,7 +375,10 @@ dir = "{state}"
 enabled = false
 "#,
         name = contract.name,
-        broker = broker(),
+        top = setup.top,
+        slot = setup.slot,
+        table = setup.table,
+        sink = setup.sink,
         state = dir.join("state").display(),
         runtime = overrides(OVERRIDES[0]),
         postgres = overrides(OVERRIDES[1]),
@@ -398,12 +425,9 @@ fn log_tail(dir: &std::path::Path) -> String {
     )
 }
 
-fn wait_for_slot(server: &mut Child, dir: &std::path::Path, contract: &Contract) {
+fn wait_for_slot(server: &mut Child, dir: &std::path::Path, contract: &Contract, slot: &str) {
     let deadline = Instant::now() + Duration::from_secs(60);
-    let sql = format!(
-        "SELECT active FROM pg_replication_slots WHERE slot_name = 'bench_{}'",
-        contract.name
-    );
+    let sql = format!("SELECT active FROM pg_replication_slots WHERE slot_name = '{slot}'");
     while psql(&sql) != "t" {
         if let Ok(Some(status)) = server.try_wait() {
             panic!(
@@ -583,6 +607,149 @@ fn slot_bytes(slot: &str) -> (i64, i64) {
     }
 }
 
+#[derive(serde::Serialize)]
+struct Snapshot {
+    rows: u64,
+    postgres_scan_rows_per_second: f64,
+    file_rows_per_second: f64,
+    kafka_rows_per_second: f64,
+    /// rustcdc's own CPU (user + system) per row, comparable across platforms and storage.
+    file_cpu_us_per_row: f64,
+    kafka_cpu_us_per_row: f64,
+}
+
+/// User + system CPU seconds a process has used, from `ps` (`[[dd-]hh:]mm:ss[.ss]`).
+fn cpu_seconds(child: &Child) -> f64 {
+    let out = Command::new("ps")
+        .args(["-o", "time=", "-p", &child.id().to_string()])
+        .output()
+        .expect("ps");
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (days, rest) = match text.split_once('-') {
+        Some((d, r)) => (d.parse::<f64>().unwrap_or(0.0), r.to_string()),
+        None => (0.0, text),
+    };
+    let secs = rest.split(':').fold(0.0, |acc, part| {
+        acc * 60.0 + part.parse::<f64>().unwrap_or(0.0)
+    });
+    days * 86_400.0 + secs
+}
+
+/// An initial snapshot of one table, read three ways: PostgreSQL alone, rustcdc to a file, and
+/// rustcdc to Kafka. The first bounds what the source can give, the second what one rustcdc
+/// reader takes, the third what the production path delivers — which says where a snapshot's
+/// time goes, and so whether reading in parallel could shorten it.
+fn measure_snapshot(binary: &str, rows: u64) -> Snapshot {
+    psql(&format!(
+        "CREATE TABLE snap (id BIGINT PRIMARY KEY, written_us BIGINT NOT NULL, n INT NOT NULL, payload TEXT NOT NULL);
+         INSERT INTO snap SELECT g, 0, 0, repeat('s', 200) FROM generate_series(1, {rows}) g;
+         GRANT SELECT ON snap TO cdc;
+         ALTER PUBLICATION bench_pub ADD TABLE snap;
+         VACUUM ANALYZE snap;"
+    ));
+
+    let started = Instant::now();
+    let scanned = Command::new("docker")
+        .args(["exec", PG, "psql", "-U", "postgres", "-d", "bench", "-c"])
+        .arg("COPY (SELECT * FROM snap ORDER BY id) TO STDOUT")
+        .stdout(Stdio::null())
+        .status()
+        .expect("scan");
+    assert!(scanned.success(), "the PostgreSQL scan failed");
+    let scan_seconds = started.elapsed().as_secs_f64();
+
+    let contract = &contracts()[0];
+    let top = "snapshot_tables = [\"public.snap\"]".to_string();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("snap.jsonl");
+    let setup = Setup {
+        slot: "bench_snap_file".into(),
+        table: "public.snap",
+        sink: format!(
+            "type = \"file_jsonl\"\npath = \"{}\"\nrotate_size_bytes = 0",
+            file.display()
+        ),
+        top: top.clone(),
+    };
+    let started = Instant::now();
+    let mut server = spawn_server(binary, dir.path(), contract, &setup);
+    let deadline = Instant::now() + Duration::from_secs(900);
+    let file_seconds = loop {
+        let handed_off = std::fs::read_to_string(dir.path().join("server.log"))
+            .is_ok_and(|log| log.contains("snapshot-to-stream handoff completed"));
+        if handed_off {
+            let read = std::fs::read_to_string(&file)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains("\"op\":\"read\""))
+                .count();
+            if read as u64 >= rows {
+                assert_eq!(read as u64, rows, "the file snapshot wrote rows twice");
+                break started.elapsed().as_secs_f64();
+            }
+        }
+        if let Ok(Some(status)) = server.try_wait() {
+            panic!(
+                "rustcdc exited ({status}) during the file snapshot:\n{}",
+                log_tail(dir.path())
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the file snapshot did not finish:\n{}",
+            log_tail(dir.path())
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let file_cpu = cpu_seconds(&server);
+    let _ = server.kill();
+    let _ = server.wait();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let topic = "bench-snapshot";
+    create_topic(topic, &[]);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let consumer = std::thread::spawn(move || {
+        consume(topic.to_string(), false, rows as usize, "read", ready_tx)
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(90))
+        .expect("consumer subscribed");
+    let setup = Setup {
+        slot: "bench_snap_kafka".into(),
+        table: "public.snap",
+        sink: format!(
+            "type = \"kafka\"\nbrokers = \"{}\"\ntopic = \"{topic}\"",
+            broker()
+        ),
+        top,
+    };
+    let started = now_us();
+    let mut server = spawn_server(binary, dir.path(), contract, &setup);
+    let seen = consumer.join().expect("consumer").arrivals;
+    let kafka_cpu = cpu_seconds(&server);
+    let _ = server.kill();
+    let _ = server.wait();
+    assert_eq!(
+        seen.len() as u64,
+        rows,
+        "the Kafka snapshot lost rows:\n{}",
+        log_tail(dir.path())
+    );
+    let last = seen.values().map(|(_, at)| *at).max().expect("rows");
+    let kafka_seconds = (last - started) as f64 / 1e6;
+
+    Snapshot {
+        rows,
+        postgres_scan_rows_per_second: rows as f64 / scan_seconds,
+        file_rows_per_second: rows as f64 / file_seconds,
+        kafka_rows_per_second: rows as f64 / kafka_seconds,
+        file_cpu_us_per_row: file_cpu * 1e6 / rows as f64,
+        kafka_cpu_us_per_row: kafka_cpu * 1e6 / rows as f64,
+    }
+}
+
 fn machine() -> String {
     let sh = |cmd: &str| {
         Command::new("sh")
@@ -614,6 +781,8 @@ fn pipeline_bench() {
     // Zero skips the long transaction (the smoke run).
     let passes = knob("PIPELINE_BENCH_LONG_PASSES", 3);
     let long_seconds = knob("PIPELINE_BENCH_LONG_SECONDS", 20);
+    // Zero skips the initial-snapshot measurement.
+    let snapshot_rows = knob("PIPELINE_BENCH_SNAPSHOT_ROWS", 1_000_000);
 
     let _containers = start_containers();
     wait_for_broker();
@@ -626,8 +795,9 @@ fn pipeline_bench() {
         let dir = tempfile::tempdir().expect("tempdir");
         let topic = format!("bench-{}", contract.name.replace('_', "-"));
         create_topic(&topic, &[]);
-        let mut server = spawn_server(&binary, dir.path(), contract, &topic);
-        wait_for_slot(&mut server, dir.path(), contract);
+        let setup = Setup::stream(contract, &topic);
+        let mut server = spawn_server(&binary, dir.path(), contract, &setup);
+        wait_for_slot(&mut server, dir.path(), contract, &setup.slot);
 
         let first = 1 + index as i64 * rows as i64;
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -736,9 +906,12 @@ fn pipeline_bench() {
         let _ = server.wait();
     }
 
+    let snapshot = (snapshot_rows > 0).then(|| measure_snapshot(&binary, snapshot_rows));
+
     let card = card(
         &runs,
         bulk.as_ref(),
+        snapshot.as_ref(),
         &pg_version,
         rows,
         per_txn,
@@ -756,6 +929,7 @@ fn pipeline_bench() {
         "clock_probe_rtt_ms": probe_rtt_us as f64 / 1000.0,
         "runs": runs,
         "long_transaction": bulk,
+        "initial_snapshot": snapshot,
     });
     let path = artifacts::target_dir().join("pipeline-bench.json");
     std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).expect("write json");
@@ -765,6 +939,7 @@ fn pipeline_bench() {
 fn card(
     runs: &[Run],
     bulk: Option<&Bulk>,
+    snapshot: Option<&Snapshot>,
     pg: &str,
     rows: u64,
     per_txn: u64,
@@ -842,6 +1017,20 @@ fn card(
             mb(b.primary_spilled_bytes),
             b.first_after_commit_seconds,
             b.last_after_commit_seconds,
+        ));
+    }
+    if let Some(snap) = snapshot {
+        out.push_str(&format!(
+            "\nInitial snapshot of {} rows, one table\n\
+             \x20 PostgreSQL scan          {:>9} rows/s   (COPY TO STDOUT: the source's ceiling)\n\
+             \x20 rustcdc → file           {:>9} rows/s   {:>5.1} µs CPU per row\n\
+             \x20 rustcdc → Kafka          {:>9} rows/s   {:>5.1} µs CPU per row\n",
+            n(snap.rows as f64),
+            n(snap.postgres_scan_rows_per_second),
+            n(snap.file_rows_per_second),
+            snap.file_cpu_us_per_row,
+            n(snap.kafka_rows_per_second),
+            snap.kafka_cpu_us_per_row,
         ));
     }
     out.push_str(&format!(
