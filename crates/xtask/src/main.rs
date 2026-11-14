@@ -9,6 +9,7 @@
 //! CI invokes the scripts directly, so its jobs do not pay for building this crate.
 
 use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 
 mod cargo_profile;
 mod support_window;
@@ -22,8 +23,13 @@ struct Task {
 
 const TASKS: &[Task] = &[
     Task {
+        name: "gate",
+        about: "The local gate: what CI fails a pull request on, minus Docker. Run before pushing.",
+        run: |_| gate(),
+    },
+    Task {
         name: "policy-gate",
-        about: "Every repository gate a pull request must pass. Run this before pushing.",
+        about: "The repository policy checks alone (the last step of `gate`).",
         run: |args| script("ci-policy-gate.sh", args),
     },
     Task {
@@ -72,6 +78,11 @@ const TASKS: &[Task] = &[
         run: |args| script("ci-pull-relational-images.sh", args),
     },
     Task {
+        name: "release-ready",
+        about: "Can this commit (default: origin/main) be tagged? The release's own check. Needs gh.",
+        run: |args| script("release-ready.sh", args),
+    },
+    Task {
         name: "evidence",
         about: "Run the full integration matrix and collect release evidence (slow).",
         run: |args| script("run_full_integration_matrix_evidence.sh", args),
@@ -112,6 +123,96 @@ fn usage() {
         println!("  {:width$}  {}", task.name, task.about, width = width);
     }
     println!("\nEvery task runs from the repository root, whatever directory you invoke it from.");
+}
+
+/// The gate's steps, in order. The one list of them: `AGENTS.md` and CI's docs name the command.
+///
+/// `server` is the whole server test command CI runs, not `--lib`: integration-free targets
+/// such as `tests/architecture.rs` fail pull requests too, and the container suites skip
+/// without their environment variable.
+const GATE: &[(&str, &[&str])] = &[
+    ("fmt", &["cargo", "fmt", "--all", "--check"]),
+    (
+        "clippy",
+        &[
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    ),
+    (
+        "lib",
+        &["cargo", "test", "-p", "rustcdc", "--lib", "--all-features"],
+    ),
+    (
+        "server",
+        &[
+            "cargo",
+            "test",
+            "-p",
+            "rustcdc-server",
+            "--all-features",
+            "--locked",
+        ],
+    ),
+    ("policy-gate", &["bash", "scripts/ci-policy-gate.sh"]),
+];
+
+/// Run the gate, stop at the first failing step, and end with one line per step.
+fn gate() -> Result<(), String> {
+    let root = workspace_root()?;
+    let started = Instant::now();
+    let mut ran: Vec<(&str, bool, Duration)> = Vec::new();
+    for (name, argv) in GATE {
+        eprintln!("\n== gate: {name}  ({})", argv.join(" "));
+        let step = Instant::now();
+        let ok = Command::new(argv[0])
+            .args(&argv[1..])
+            .current_dir(&root)
+            .status()
+            .map_err(|error| format!("could not run {}: {error}", argv[0]))?
+            .success();
+        ran.push((name, ok, step.elapsed()));
+        if !ok {
+            print_gate(&ran);
+            let hint = if *name == "fmt" {
+                "; `cargo fmt --all` fixes it"
+            } else {
+                ""
+            };
+            return Err(format!("failed at {name}, its output is above{hint}"));
+        }
+    }
+    print_gate(&ran);
+    eprintln!("gate passed in {}", human(started.elapsed()));
+    Ok(())
+}
+
+fn print_gate(ran: &[(&str, bool, Duration)]) {
+    eprintln!();
+    for (name, _) in GATE {
+        let line = match ran.iter().find(|(ran_name, ..)| ran_name == name) {
+            Some((_, true, took)) => format!("ok      {:>7}", human(*took)),
+            Some((_, false, took)) => format!("FAILED  {:>7}", human(*took)),
+            None => "not run".to_owned(),
+        };
+        eprintln!("  {name:<12} {line}");
+    }
+}
+
+/// `38s`, `1m 24s`.
+fn human(took: Duration) -> String {
+    let secs = took.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
 }
 
 /// The cfg that opens the `test-harnesses` release guard for benchmark builds.

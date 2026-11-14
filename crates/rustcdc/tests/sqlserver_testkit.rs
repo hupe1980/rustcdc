@@ -3,7 +3,9 @@
 use rustcdc::{SqlServerSourceConfig, TransportConfig};
 use std::time::Duration;
 use testcontainers::{
-    ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort, runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
+    core::{IntoContainerPort, WaitFor},
+    runners::AsyncRunner,
 };
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -71,11 +73,16 @@ pub fn tested_tags() -> Vec<&'static str> {
 pub async fn start_sqlserver_container(
     image_tag: &str,
 ) -> rustcdc::Result<ContainerAsync<GenericImage>> {
+    // SQL Server listens before its startup is over; a suite that connects in that window can
+    // be refused for longer than its retries allow on a loaded runner. "Recovery is complete" is
+    // the last line of its startup on every tested release.
     match GenericImage::new("mcr.microsoft.com/mssql/server", image_tag)
         .with_exposed_port(1433.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Recovery is complete"))
         .with_env_var("ACCEPT_EULA", "Y")
         .with_env_var("MSSQL_SA_PASSWORD", SQLSERVER_SA_PASSWORD)
         .with_env_var("MSSQL_PID", "Developer")
+        .with_startup_timeout(Duration::from_secs(240))
         .start()
         .await
         .map_err(|error| rustcdc::Error::SourceError(error.to_string()))

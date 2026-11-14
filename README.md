@@ -104,12 +104,10 @@ Rust 1.97.0+, and a C toolchain for the server's dependency graph (`cmake`, `cla
 `perl`, `pkg-config`). Every command runs from the repository root.
 
 ```bash
-cargo build                                        # both crates
-cargo test -p rustcdc --lib --all-features         # the library
-cargo test -p rustcdc-server --lib --all-features  # the server
-cargo xtask                                        # the repository's gates, listed
-cargo xtask policy-gate                            # the one a pull request must pass
-cargo xtask bench                                  # benchmarks (never plain `cargo bench`)
+cargo build         # both crates
+cargo xtask gate    # what CI fails a pull request on, minus Docker
+cargo xtask         # every task, listed
+cargo xtask bench   # benchmarks (never plain `cargo bench`)
 ```
 
 ## License

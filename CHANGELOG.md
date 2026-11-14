@@ -5,6 +5,31 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## Unreleased
+
+### Changed: faster CI, one local gate, and a release check
+
+- **`rustcdc-server` no longer recompiles on every build** when the console is not built (CI, a
+  fresh clone) or in a git worktree: its build script watched a path that did not exist, which
+  cargo treats as always changed.
+- **`cargo xtask gate`** runs what CI fails a pull request on, minus Docker, and ends with one line
+  per step. It runs the server's whole test command, so a test target outside `--lib`, such as the
+  file-size budgets, fails locally too.
+- **`cargo xtask release-ready`** says whether a commit can be tagged: CI on main passed and
+  uploaded the release evidence. It prints the tag command when it can, and why not when it can't.
+  The release's verify step runs the same script.
+- **CI:** only `main` writes caches, so a pull request's no longer evict the ones every run reads;
+  the release evidence runs on main only, where the release reads it; the fuzz job is cached.
+- **SQL Server suites** start once SQL Server has finished starting ("Recovery is complete"), not
+  when it first listens: a suite that connected in between was refused for longer than its retries
+  on a loaded runner.
+- *Evidence*: a fresh worktree without the console built the server twice, recompiling it each
+  time, and now builds nothing the second time; with the `ui/dist` half reverted it recompiles
+  again. A test file planted over its line budget fails `cargo xtask gate` at `server`. With the wait
+  pointed at a line SQL Server never logs, a suite fails at startup instead of running. `release-ready` was
+  run against a released, a passed, a failed and an unmerged commit, and with GitHub refusing and
+  unreachable.
+
 ## 0.23.1
 
 A crash part-way through a PostgreSQL transaction larger than one batch lost the rest of it. Every
