@@ -643,9 +643,10 @@ pub trait StreamHandle: Send + Sync {
     /// is delivered in as many batches as it takes, and the runtime checkpoints after each;
     /// answering `end_lsn` for an earlier event moves the checkpoint and the slot past rows
     /// not yet delivered, which a crash then loses. The PostgreSQL handle returns `end_lsn`
-    /// for the last event and, for every other, the last committed end read before the
-    /// transaction's BEGIN — so a restart part-way through replays the whole transaction.
-    /// A handle that wraps another stream must forward this.
+    /// for the last event and, for every other, the highest position the stream had reached
+    /// at the transaction's BEGIN (its start, a committed end, or a standalone event's own
+    /// offset) — so a restart part-way through replays the whole transaction. A handle that
+    /// wraps another stream must forward this.
     ///
     /// The runtime uses this for both the durable checkpoint and the source-side
     /// confirmation, so a connector implementing it fixes replication-slot retention and

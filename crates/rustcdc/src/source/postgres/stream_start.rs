@@ -95,6 +95,16 @@ pub(super) async fn start_postgres_stream(
     } else {
         0
     };
+    // Where the stream itself starts, which is where a transaction's earlier events may
+    // resume from. With a checkpoint that is the checkpoint. Without one, `lsn_position` is
+    // the WAL head (kept as the snapshot watermark above), but the stream starts at the
+    // slot's `confirmed_flush_lsn`: a transaction the slot already holds commits between the
+    // two, and resuming from the head would skip its undelivered rows.
+    let resume_floor = if resume_from.is_some() {
+        stream.lsn_position
+    } else {
+        super::query_slot_confirmed_lsn(&client, &stream.slot_name).await?
+    };
     // Cloned before the SqlPeek branch can move `client` into the provider. Under that
     // transport the reselect shares the provider's connection rather than opening a second
     // one; under streaming replication the WAL has its own socket and this is the only
@@ -162,6 +172,7 @@ pub(super) async fn start_postgres_stream(
             catalog_columns,
             reselect_client,
         )
+        .with_resume_floor(resume_floor)
         .with_slot_state_sample_interval_ms(connection.config.slot_state_sample_interval_ms)
         .with_relation_catalog(Box::new(relation_catalog)),
     ))

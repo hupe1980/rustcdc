@@ -561,9 +561,14 @@ at all. Nudging the LSN forward does not help; the commit record is still ahead 
 The connector answers this through `StreamHandle::resume_offset_for`. For PostgreSQL it returns
 the COMMIT message's `end_lsn` — the position *after* the commit record — for a transaction's
 **last** event only. A transaction larger than one batch is delivered in several, and the
-runtime checkpoints after each, so every earlier event of it resumes from the last committed
-end read before its BEGIN: never behind an earlier checkpoint, and before the commit record,
-so a crash part-way through replays the whole transaction instead of skipping its rest. The
+runtime checkpoints after each, so every earlier event of it resumes from the highest position
+the stream had reached at its BEGIN — where it started (the checkpoint, or the slot's
+`confirmed_flush_lsn` without one), a committed end, or a standalone event's own offset: never
+behind an earlier checkpoint, and before the commit record, so a crash part-way through
+replays the whole transaction instead of skipping its rest. *Limit:* the handle remembers the
+boundaries of the last 100,000 transactions not yet confirmed. Past that, an event falls back
+to its own change position, which still replays its transaction but can sit behind an earlier
+checkpoint. The
 runtime uses the answer for the durable checkpoint and for the source-side confirmation, so
 slot retention and restart duplicates move together. A stream handle that wraps another, such
 as the incremental-snapshot driver, forwards it. MySQL and SQL Server need no override: binlog `log_pos` is

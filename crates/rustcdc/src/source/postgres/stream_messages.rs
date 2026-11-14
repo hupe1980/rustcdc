@@ -554,6 +554,15 @@ impl PostgresStreamHandle {
         captured.to_event(&self.source_name, format_pg_lsn(lsn), ts_ms)
     }
 
+    /// A standalone event — outside any transaction — checkpoints at its own offset, so no
+    /// later resume position may fall behind it. Read from the offset the event carries, the
+    /// one the runtime stores, rather than recomputed.
+    fn raise_resume_floor_to(&mut self, event: &Event) {
+        if let Ok(lsn) = super::parser::parse_pg_lsn(&event.source.offset) {
+            self.resume_floor = self.resume_floor.max(lsn);
+        }
+    }
+
     pub(super) async fn process_messages(
         &mut self,
         xlog_data: Vec<PgOutputXLogData>,
@@ -575,13 +584,12 @@ impl PostgresStreamHandle {
                     }
                     self.current_xid = Some(begin.xid);
                     self.current_commit_ts = pg_timestamp_to_millis(begin.commit_timestamp_us);
-                    // `lsn_position` moves only at a COMMIT (or at stream start), so here it
-                    // is the last committed end before this BEGIN.
-                    self.current_tx_start = self.stream.lsn_position;
+                    self.current_tx_start = self.resume_floor;
                     self.partial_tx_events.clear();
                 }
                 PgOutputMessage::Commit(commit) => {
                     self.stream.lsn_position = commit.end_lsn;
+                    self.resume_floor = self.resume_floor.max(commit.end_lsn);
                     // Remember where this transaction starts and ends: its events resume from
                     // the start until its last one. See `PostgresStreamHandle::resume_offset_for`.
                     if let Some(xid) = self.current_xid {
@@ -717,6 +725,7 @@ impl PostgresStreamHandle {
                             self.partial_tx_events.push(schema_event);
                         } else {
                             self.events_polled = self.events_polled.saturating_add(1);
+                            self.raise_resume_floor_to(&schema_event);
                             committed.push(schema_event);
                         }
                     }
@@ -743,6 +752,7 @@ impl PostgresStreamHandle {
                             self.partial_tx_events.push(event);
                         } else {
                             self.events_polled = self.events_polled.saturating_add(1);
+                            self.raise_resume_floor_to(&event);
                             committed.push(event);
                         }
                     }

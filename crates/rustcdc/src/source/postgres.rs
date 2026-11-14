@@ -116,6 +116,14 @@ pub struct PostgresStreamHandle {
     /// The last committed end read before the open transaction's BEGIN: where a restart
     /// resumes from while that transaction has not been delivered whole.
     current_tx_start: u64,
+    /// The highest position a checkpoint of this stream can already hold: where the stream
+    /// started, then raised by every COMMIT end and every standalone event's own offset.
+    ///
+    /// A BEGIN copies it into `current_tx_start`. It is never past the commit record of a
+    /// transaction not yet delivered — the stream starts before them, and a transaction is
+    /// released only after its commit record — so resuming from it replays such a
+    /// transaction, and since it only rises, no resume position falls behind an earlier one.
+    resume_floor: u64,
     /// `(tx_id, start_lsn, end_lsn)` for transactions released to the consumer but not yet
     /// confirmed.
     ///
@@ -203,6 +211,7 @@ impl PostgresStreamHandle {
         catalog_columns: crate::source::schema_catalog::CatalogSchemas,
         reselect_client: Option<Arc<Client>>,
     ) -> Self {
+        let resume_floor = stream.lsn_position;
         Self {
             source_name,
             stream,
@@ -219,6 +228,7 @@ impl PostgresStreamHandle {
             current_commit_ts: 0,
             partial_tx_events: Vec::new(),
             current_tx_start: 0,
+            resume_floor,
             committed_tx_ends: std::collections::VecDeque::new(),
             events_polled: 0,
             max_events_per_poll: max_events_per_poll.max(1),
@@ -236,6 +246,16 @@ impl PostgresStreamHandle {
             reselect_client,
             reselect_column_types: reselect::ColumnTypeCache::new(),
         }
+    }
+
+    /// Where the stream really starts, when that is not its `lsn_position`.
+    ///
+    /// Without a checkpoint `lsn_position` is the WAL head (the snapshot watermark), but the
+    /// stream itself starts at the slot's `confirmed_flush_lsn`; a transaction the slot
+    /// already holds commits between the two.
+    fn with_resume_floor(mut self, lsn: u64) -> Self {
+        self.resume_floor = lsn;
+        self
     }
 
     fn with_slot_state_sample_interval_ms(mut self, interval_ms: Option<u64>) -> Self {
@@ -1324,9 +1344,9 @@ impl StreamHandle for PostgresStreamHandle {
         // from its end — `StreamHandle::resume_offset_for` explains why that position is the
         // one that skips it. An earlier event resuming from there would move both past rows
         // still in memory, and a crash before they were delivered would lose them for good
-        // (#43). Every other event resumes from the last committed end read before the
-        // BEGIN: never behind an earlier checkpoint, and before the commit record, so a
-        // restart replays the whole transaction.
+        // (#43). Every other event resumes from `resume_floor` as it stood at the BEGIN: the
+        // highest position already checkpointable, and before the commit record, so a restart
+        // replays the whole transaction.
         //
         // Every event released by the decoder belongs to a transaction whose COMMIT has
         // already been read, so the lookup always hits for an event this handle produced.
@@ -1445,6 +1465,10 @@ async fn reconcile_stream_resume_lsn_with_retry(
 
 async fn query_current_wal_lsn(client: &Client) -> Result<u64> {
     query::query_current_wal_lsn(client).await
+}
+
+async fn query_slot_confirmed_lsn(client: &Client, slot_name: &str) -> Result<u64> {
+    query::query_slot_confirmed_lsn(client, slot_name).await
 }
 
 async fn run_connection_task<S>(connection: Connection<Socket, S>)
@@ -2026,6 +2050,46 @@ mod tests {
             ],
             "a batch cut inside a transaction must not resume past it"
         );
+    }
+
+    /// A standalone event checkpoints at its own position, so a transaction after it must not
+    /// resume from before that: the checkpoint would move backwards.
+    #[tokio::test]
+    async fn a_transaction_after_a_standalone_message_resumes_no_earlier_than_it() {
+        let provider = MockPgOutputProvider::new(vec![vec![
+            xlog(100, build_relation(16384, "public", "t", &[("id", true)])),
+            xlog(
+                300,
+                build_logical_message(false, 300, "audit", b"standalone"),
+            ),
+            xlog(400, build_begin(900, 0, 7)),
+            xlog(500, build_insert(16384, &[Some("1")])),
+            xlog(600, build_insert(16384, &[Some("2")])),
+            xlog(900, build_commit(900, 950, 0)),
+        ]]);
+        let mut handle = make_stream_handle(50, provider);
+        let events = handle.next_events(100).await.unwrap();
+        let message = events
+            .iter()
+            .find(|event| event.op == crate::core::Operation::Message)
+            .expect("the standalone message is released");
+        assert!(message.transaction.is_none());
+        let lsn = |value: u64| super::parser::format_pg_lsn(value);
+        assert_eq!(message.source.offset, lsn(300));
+
+        let rows = rows_only(events)
+            .into_iter()
+            .filter(|event| event.op == crate::core::Operation::Insert)
+            .collect::<Vec<_>>();
+        let resumes: Vec<String> = rows
+            .iter()
+            .map(|event| {
+                handle
+                    .resume_offset_for(event)
+                    .expect("a stream event resumes")
+            })
+            .collect();
+        assert_eq!(resumes, vec![lsn(300), lsn(950)]);
     }
 
     fn make_stream_handle(

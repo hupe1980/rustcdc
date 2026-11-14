@@ -684,6 +684,21 @@ async fn runtime_postgres_process_kill_mid_stream_loses_no_committed_row() -> ru
 #[tokio::test]
 async fn runtime_postgres_process_kill_after_the_first_batch_of_a_large_transaction_loses_no_row()
 -> rustcdc::Result<()> {
+    kill_after_the_first_batch_of_a_large_transaction(true).await
+}
+
+/// The same, starting with no checkpoint while the slot already holds the transaction: the
+/// stream begins at the slot's `confirmed_flush_lsn`, and that — not the WAL head, which is
+/// past the transaction's commit record — is where its earlier events must resume.
+#[tokio::test]
+async fn runtime_postgres_process_kill_after_the_first_batch_of_a_backlogged_transaction_without_a_checkpoint_loses_no_row()
+-> rustcdc::Result<()> {
+    kill_after_the_first_batch_of_a_large_transaction(false).await
+}
+
+async fn kill_after_the_first_batch_of_a_large_transaction(
+    seed_checkpoint: bool,
+) -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres large-transaction crash test (set CDC_RS_RUN_DOCKER_TESTS=1)");
         return Ok(());
@@ -741,17 +756,18 @@ async fn runtime_postgres_process_kill_after_the_first_batch_of_a_large_transact
         .map_err(|e| error(&e))?
         .get(0);
     let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
-    let mut seed = FileCheckpoint::new(checkpoint_dir.path());
-    seed.save(
-        &PostgresOffset {
-            lsn: parse_pg_lsn(&lsn_text)?,
-            slot_name: "large_tx_slot".to_string(),
-            incremental_snapshot: None,
-        },
-        0,
-    )
-    .await?;
-    drop(seed);
+    if seed_checkpoint {
+        let mut seed = FileCheckpoint::new(checkpoint_dir.path());
+        seed.save(
+            &PostgresOffset {
+                lsn: parse_pg_lsn(&lsn_text)?,
+                slot_name: "large_tx_slot".to_string(),
+                incremental_snapshot: None,
+            },
+            0,
+        )
+        .await?;
+    }
 
     // One committed transaction, many times the worker's 256-event batch.
     admin
