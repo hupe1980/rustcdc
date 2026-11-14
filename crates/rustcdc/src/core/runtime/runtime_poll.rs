@@ -715,7 +715,7 @@ impl CdcRuntime {
             };
 
             if let Some(limit) = max_bytes {
-                let event_bytes = estimate_event_bytes(&event);
+                let event_bytes = event.estimated_serialized_bytes();
                 // Always deliver at least one event, even if it alone exceeds the
                 // budget. Refusing would stall the pipeline permanently on a single
                 // oversized row with no way for the caller to make progress; the batch
@@ -1293,39 +1293,6 @@ impl CdcRuntime {
             Some((result, (runtime, token)))
         })
     }
-}
-
-/// Approximate serialized size of an event, for `max_event_bytes` accounting.
-///
-/// Uses the JSON payload sizes plus the fixed-ish envelope overhead rather than
-/// serializing the whole event: this runs per event on the poll path, and an exact
-/// figure would mean paying a full `serde_json::to_vec` for a number used only to
-/// decide where to cut the batch. Overestimating slightly is the safe direction for a
-/// downstream size limit.
-fn estimate_event_bytes(event: &Event) -> usize {
-    fn payload_len(value: Option<&serde_json::Value>) -> usize {
-        value.map_or(0, |value| match value {
-            serde_json::Value::Null => 4,
-            serde_json::Value::Bool(_) => 5,
-            serde_json::Value::Number(n) => n.to_string().len(),
-            serde_json::Value::String(s) => s.len() + 2,
-            // Objects and arrays dominate real payloads; serialize only these.
-            other => serde_json::to_string(other).map_or(0, |s| s.len()),
-        })
-    }
-
-    payload_len(event.before.row())
-        + payload_len(event.after.as_ref())
-        + event.table.len()
-        + event.schema.as_deref().map_or(0, str::len)
-        + event.source.source_name.len()
-        + event.source.offset.len()
-        + event
-            .primary_key
-            .as_deref()
-            .map_or(0, |keys| keys.iter().map(String::len).sum::<usize>())
-        // Envelope scaffolding: field names, quoting, separators, timestamps.
-        + 128
 }
 
 /// Whether a failed reconnect step is one no retry can fix, so the loop returns it now.

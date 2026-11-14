@@ -1068,6 +1068,8 @@ pub(crate) mod tests {
             stream_buffer_memory_bytes:
                 rustcdc::PostgresSourceConfig::default_stream_buffer_memory_bytes(),
             stream_spill_directory: None,
+            transaction_buffer_bytes:
+                rustcdc::PostgresSourceConfig::default_transaction_buffer_bytes(),
         };
         AppConfig {
             api_version: AppConfig::SUPPORTED_API_VERSION.to_string(),

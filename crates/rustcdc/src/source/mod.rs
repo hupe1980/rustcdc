@@ -19,6 +19,7 @@ pub mod snapshot_tracker;
 pub mod snapshot_validator;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
+pub mod transaction_buffer;
 
 pub use incremental_snapshot::{
     BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver, SnapshotTable,
@@ -30,6 +31,7 @@ pub use incremental_snapshot::{
 pub use snapshot_progress::{SnapshotCheckpointHelper, SnapshotProgress, TableProgress};
 pub use snapshot_tracker::{SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport};
 pub use snapshot_validator::{SnapshotValidationResult, SnapshotValidator};
+pub use transaction_buffer::TransactionRelease;
 
 /// Authentication mode for database source connectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

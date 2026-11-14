@@ -936,6 +936,40 @@ impl Default for Event {
 }
 
 impl Event {
+    /// Approximate serialized size of the event: the runtime's `max_event_bytes` and a
+    /// source's transaction buffer both measure with it, so the two limits agree.
+    ///
+    /// Uses the JSON payload sizes plus the fixed-ish envelope overhead rather than
+    /// serializing the whole event: this runs per event on the poll path, and an exact
+    /// figure would mean paying a full `serde_json::to_vec` for a number used only to
+    /// decide where to cut the batch. Overestimating slightly is the safe direction for a
+    /// downstream size limit. It is not the event's size in memory, which is larger.
+    pub(crate) fn estimated_serialized_bytes(&self) -> usize {
+        fn payload_len(value: Option<&serde_json::Value>) -> usize {
+            value.map_or(0, |value| match value {
+                serde_json::Value::Null => 4,
+                serde_json::Value::Bool(_) => 5,
+                serde_json::Value::Number(n) => n.to_string().len(),
+                serde_json::Value::String(s) => s.len() + 2,
+                // Objects and arrays dominate real payloads; serialize only these.
+                other => serde_json::to_string(other).map_or(0, |s| s.len()),
+            })
+        }
+
+        payload_len(self.before.row())
+            + payload_len(self.after.as_ref())
+            + self.table.len()
+            + self.schema.as_deref().map_or(0, str::len)
+            + self.source.source_name.len()
+            + self.source.offset.len()
+            + self
+                .primary_key
+                .as_deref()
+                .map_or(0, |keys| keys.iter().map(String::len).sum::<usize>())
+            // Envelope scaffolding: field names, quoting, separators, timestamps.
+            + 128
+    }
+
     /// The one row write that is correct for this event.
     ///
     /// Prefer this over reading [`Event::after`] directly in a sink. It folds
