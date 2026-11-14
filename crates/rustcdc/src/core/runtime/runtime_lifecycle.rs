@@ -475,6 +475,9 @@ impl CdcRuntime {
             // Shutdown latency is therefore bounded by `max_poll_wait_ms`, which is the
             // budget the poll already promises to return within.
             if shutdown.is_cancelled() {
+                // What was acknowledged under a checkpoint interval is made durable on
+                // the way out, not left for the next start to replay.
+                self.flush_checkpoint().await?;
                 break;
             }
 
@@ -556,6 +559,10 @@ impl CdcRuntime {
             return Err(error);
         }
 
+        // Acknowledged under a checkpoint interval but not yet written: owed before the
+        // source is closed. A failure leaves the runtime running, so `stop` can be retried.
+        self.flush_checkpoint().await?;
+
         self.state = RuntimeState::Stopping;
         self.delivered_not_committed = 0;
         self.pending_delivery = None;
@@ -608,6 +615,16 @@ impl CdcRuntime {
             RuntimeState::Running => {}
         }
 
+        // The acknowledged events are not the uncommitted ones this discards; their
+        // position is still owed. Best effort: a forced stop must not be refused.
+        if let Err(error) = self.flush_checkpoint().await {
+            tracing::warn!(
+                target: "rustcdc::core::runtime",
+                error = %error.report(),
+                "force_stop could not write the deferred checkpoint; a restart replays what \
+                 was acknowledged since the last write",
+            );
+        }
         self.state = RuntimeState::Stopping;
         // Drained in **delivery order**, which is the order `poll_event_batch` would have
         // produced them in: the in-flight delivery first, then what is buffered behind

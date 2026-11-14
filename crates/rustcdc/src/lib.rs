@@ -111,18 +111,18 @@ pub mod wasm;
 pub use tokio_util::sync::CancellationToken;
 
 pub use crate::core::{
-    AckMode, AckToken, BeforeImage, CdcRuntime, ConnectionRetryPolicy, EVENT_ENVELOPE_VERSION,
-    Error, ErrorChain, ErrorKind, ErrorReport, Event, EventBatch, EventBuilder,
-    EventIdempotencyGuard, EventTracer, FingerprintError, HEALTH_MIN_CONFIGURABLE_STALL_MS,
-    HealthVerdict, IdempotencyOptions, MetricsCollector, NoOpEventTracer, NoOpMetricsCollector,
-    NoRowWrite, Offset, OpenTransaction, Operation, PostCommitSourceConfirmPolicy, Result,
-    RowWrite, RuntimeAdminSnapshot, RuntimeConfig, RuntimeControl, RuntimeObservability,
-    RuntimeOptions, RuntimeSourceConfig, RuntimeState, SecretProvider, SecretString, SlotWalStatus,
-    SnapshotMetadata, SourceErrorKind, SourceMetadata, StallCause, StallOwner,
-    StreamedTransactions, StructuredLogger, TransactionBoundaryPolicy, TransactionMetadata,
-    TransformErrorPolicy, TransportConfig, ValidationError, ValidationErrorPolicy,
-    ValidationErrors, fingerprint_event_stable, fingerprint_event_transient, render_error_chain,
-    write_runtime_metrics_prometheus,
+    AckMode, AckToken, BeforeImage, CdcRuntime, ConnectionRetryPolicy,
+    DEFAULT_CHECKPOINT_MAX_EVENTS, EVENT_ENVELOPE_VERSION, Error, ErrorChain, ErrorKind,
+    ErrorReport, Event, EventBatch, EventBuilder, EventIdempotencyGuard, EventTracer,
+    FingerprintError, HEALTH_MIN_CONFIGURABLE_STALL_MS, HealthVerdict, IdempotencyOptions,
+    MetricsCollector, NoOpEventTracer, NoOpMetricsCollector, NoRowWrite, Offset, OpenTransaction,
+    Operation, PostCommitSourceConfirmPolicy, Result, RowWrite, RuntimeAdminSnapshot,
+    RuntimeConfig, RuntimeControl, RuntimeObservability, RuntimeOptions, RuntimeSourceConfig,
+    RuntimeState, SecretProvider, SecretString, SlotWalStatus, SnapshotMetadata, SourceErrorKind,
+    SourceMetadata, StallCause, StallOwner, StreamedTransactions, StructuredLogger,
+    TransactionBoundaryPolicy, TransactionMetadata, TransformErrorPolicy, TransportConfig,
+    ValidationError, ValidationErrorPolicy, ValidationErrors, fingerprint_event_stable,
+    fingerprint_event_transient, render_error_chain, write_runtime_metrics_prometheus,
 };
 #[cfg(feature = "metrics")]
 pub use crate::core::{

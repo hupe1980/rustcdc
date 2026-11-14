@@ -138,6 +138,9 @@ impl CdcRuntime {
         // drop events, because this future is not cancel-safe.
         self.service_control_commands().await?;
 
+        // An interval that ran out while the pipeline was quiet: nothing else would write it.
+        self.flush_checkpoint_if_due().await?;
+
         let metrics = Arc::clone(&self.observability().metrics);
 
         // Retry a source confirmation that failed after a durable commit, BEFORE any
@@ -276,6 +279,8 @@ impl CdcRuntime {
                         // last durable checkpoint.  Fail loud instead: the checkpoint
                         // store being unreachable is exactly the condition under which we
                         // must not guess a resume position.
+                        // Resume from everything acknowledged, not from the last write.
+                        self.flush_checkpoint().await?;
                         let resume_offset =
                             self.config.checkpoint.load().await.map_err(|error| {
                                 crate::core::Error::CheckpointError(format!(
@@ -405,6 +410,7 @@ impl CdcRuntime {
                                 // because `start_stream(None)` resumes from the live log
                                 // head and silently skips everything since the last
                                 // durable checkpoint.
+                                self.flush_checkpoint().await?;
                                 let resume_offset =
                                     self.config.checkpoint.load().await.map_err(|error| {
                                         crate::core::Error::CheckpointError(format!(

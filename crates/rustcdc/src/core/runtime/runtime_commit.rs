@@ -1,10 +1,16 @@
 use super::*;
+use crate::checkpoint::Checkpoint;
 
 impl CdcRuntime {
     /// Commit an acknowledged batch, advancing the checkpoint barrier.
     ///
     /// Accepts either an [`AckMode`] (returned by [`EventBatch::ack_mode()`]) or a
     /// raw [`AckToken`] directly.
+    ///
+    /// With the default [`RuntimeOptions::checkpoint_interval`] of zero, the position is
+    /// durable and confirmed to the source when this returns. With an interval, it is
+    /// accepted and written within the interval, or by [`stop`](Self::stop); a crash in
+    /// between replays those events, and loses none.
     ///
     /// When `mode` is [`AckMode::NotRequired`] (empty batch or disabled source) this
     /// is a safe, low-cost no-op. Callers do **not** need to guard the call:
@@ -72,8 +78,7 @@ impl CdcRuntime {
             ));
         }
 
-        self.persist_snapshot_checkpoint_before_commit(count)
-            .await?;
+        let snapshot_target = self.snapshot_checkpoint_target(count)?;
 
         let started = tokio::time::Instant::now();
         let confirmation_lsn = self.committed_confirmation_lsn(count)?;
@@ -83,37 +88,60 @@ impl CdcRuntime {
         self.observability()
             .tracer
             .trace_checkpoint_barrier("flushing");
-        // Acceptance and the durable write are one operation (see `accept_and_commit`),
-        // which restores the pre-call state on failure, so retrying the identical
-        // `commit_ack` is correct.
-        self.commit_barrier
-            .accept_and_commit(count as u64, &mut *self.config.checkpoint)
-            .await
-            .inspect_err(|error| self.record_runtime_error("runtime.commit.checkpoint", error))?;
 
-        // Durability is guaranteed once the commit barrier flush succeeds. Post-commit
-        // source confirmation failures are handled by policy.
-        let mut post_commit_failures = Vec::new();
+        let durable_now = self.checkpoint_due(count as u64);
+        let mut held = self.deferred.save.take();
+        let mut cadence = Cadence {
+            store: &mut *self.config.checkpoint,
+            held: &mut held,
+            defer: !durable_now,
+        };
+        // The snapshot's own progress goes first, so a mixed prefix ends at the stream
+        // position the barrier writes after it.
+        let snapshot_written = match (snapshot_target, self.snapshot.as_ref()) {
+            (Some(target), Some(snapshot)) => snapshot.checkpoint(&mut cadence, target).await,
+            _ => Ok(()),
+        };
+        // Acceptance and the write are one operation (see `accept_and_commit`), which
+        // restores the pre-call state on failure, so retrying the identical `commit_ack` is
+        // correct.
+        let accepted = match snapshot_written {
+            Ok(()) => self
+                .commit_barrier
+                .accept_and_commit(count as u64, &mut cadence)
+                .await
+                .map_err(|error| ("runtime.commit.checkpoint", error)),
+            Err(error) => Err(("runtime.commit.snapshot_checkpoint", error)),
+        };
+        self.deferred.save = held;
+        if let Err((context, error)) = accepted {
+            self.record_runtime_error(context, &error);
+            return Err(error);
+        }
 
-        if let Some(lsn) = confirmation_lsn
-            && let Some(stream) = self.stream.as_mut()
-        {
-            match stream.confirm_lsn(lsn).await {
-                Ok(()) => {
-                    // Confirmed: any earlier unconfirmed position is now superseded.
-                    self.pending_confirmation_lsn = None;
-                    self.unconfirmed_stall_polls = 0;
-                }
+        // A later position supersedes an earlier one the source has not been told yet.
+        let confirmation_lsn = confirmation_lsn.or(self.deferred.confirmation_lsn.take());
+        self.deferred.events = self.deferred.events.saturating_add(count as u64);
+        self.deferred.confirmation_lsn = confirmation_lsn;
+        // When this prefix carried no position of its own, an earlier deferred one is still
+        // the latest and is owed now. The events are accepted either way: a failure leaves
+        // it deferred for the next poll to retry, as it would be under a longer interval.
+        let post_commit_failures = if durable_now {
+            match self.flush_deferred().await {
+                Ok(failures) => failures,
                 Err(error) => {
-                    // Retain the LSN so the next poll can retry *before* the
-                    // idempotency guard suppresses the replayed events. Without
-                    // this the runtime stalls silently and forever.
-                    self.pending_confirmation_lsn = Some(lsn);
-                    self.record_runtime_error("runtime.commit.confirm_lsn", &error);
-                    post_commit_failures.push(("stream confirm_lsn", error));
+                    tracing::warn!(
+                        target: "rustcdc::core::runtime",
+                        error = %error.report(),
+                        "checkpoint write failed after the commit was accepted; \
+                         retrying on the next poll",
+                    );
+                    Vec::new()
                 }
             }
-        }
+        } else {
+            Vec::new()
+        };
 
         // Build trace ids only when a tracer will actually consume them.
         //
@@ -140,7 +168,6 @@ impl CdcRuntime {
         let now_ms = now_millis();
         self.last_commit_at_ms = Some(now_ms);
         self.delivery_failure = None;
-        self.last_checkpoint_saved_at_ms = Some(now_ms);
         if let Some(pending) = self.pending_delivery.as_mut() {
             pending.committed_prefix += count;
             pending.ack_epoch = pending.ack_epoch.saturating_add(1);
@@ -162,6 +189,94 @@ impl CdcRuntime {
             .trace_checkpoint_barrier("committed");
         self.record_replication_lag_metric();
 
+        self.apply_post_commit_policy(post_commit_failures, count)
+    }
+
+    /// Whether this commit writes the checkpoint now rather than holding it.
+    fn checkpoint_due(&self, accepting: u64) -> bool {
+        let options = &self.config.options;
+        options.checkpoint_interval.is_zero()
+            || self.deferred.last_durable_at.elapsed() >= options.checkpoint_interval
+            || self.deferred.events.saturating_add(accepting) >= options.checkpoint_max_events
+    }
+
+    /// Write what earlier commits deferred, and tell the source, if the interval has run
+    /// out. Called between polls, so a pipeline that goes quiet still becomes durable.
+    pub(super) async fn flush_checkpoint_if_due(&mut self) -> Result<()> {
+        if self.deferred.is_empty() || !self.checkpoint_due(0) {
+            return Ok(());
+        }
+        self.flush_checkpoint().await
+    }
+
+    /// Write what earlier commits deferred, and tell the source, now.
+    ///
+    /// On a write failure the deferred position is kept, so the next call retries it.
+    pub(super) async fn flush_checkpoint(&mut self) -> Result<()> {
+        if self.deferred.is_empty() {
+            return Ok(());
+        }
+        let failures = self.flush_deferred().await?;
+        self.apply_post_commit_policy(failures, 0)
+    }
+
+    /// Write the deferred position, then confirm it to the source. Returns the
+    /// confirmation failures for the caller's policy; a write failure keeps the position
+    /// deferred and is the error.
+    async fn flush_deferred(&mut self) -> Result<Vec<(&'static str, Error)>> {
+        if let Some((offset, committed)) = self.deferred.save.take()
+            && let Err(error) = self
+                .config
+                .checkpoint
+                .save(offset.as_ref(), committed)
+                .await
+        {
+            self.record_runtime_error("runtime.commit.checkpoint", &error);
+            self.deferred.save = Some((offset, committed));
+            return Err(error);
+        }
+        self.deferred.events = 0;
+        self.deferred.last_durable_at = tokio::time::Instant::now();
+        self.last_checkpoint_saved_at_ms = Some(now_millis());
+        let lsn = self.deferred.confirmation_lsn.take();
+        Ok(self.confirm_durable_position(lsn).await)
+    }
+
+    /// Tell the source a position that is now durable here. Never called for one that is
+    /// not: the source may discard what lies before it.
+    async fn confirm_durable_position(&mut self, lsn: Option<u64>) -> Vec<(&'static str, Error)> {
+        let mut failures = Vec::new();
+        if let Some(lsn) = lsn
+            && let Some(stream) = self.stream.as_mut()
+        {
+            match stream.confirm_lsn(lsn).await {
+                Ok(()) => {
+                    // Confirmed: any earlier unconfirmed position is now superseded.
+                    self.pending_confirmation_lsn = None;
+                    self.unconfirmed_stall_polls = 0;
+                }
+                Err(error) => {
+                    // Retain the LSN so the next poll can retry *before* the
+                    // idempotency guard suppresses the replayed events. Without
+                    // this the runtime stalls silently and forever.
+                    self.pending_confirmation_lsn = Some(lsn);
+                    self.record_runtime_error("runtime.commit.confirm_lsn", &error);
+                    failures.push(("stream confirm_lsn", error));
+                }
+            }
+        } else if let Some(lsn) = lsn {
+            // No stream to tell (between a disconnect and the reconnect): the next poll
+            // confirms it before anything is replayed.
+            self.pending_confirmation_lsn = Some(lsn);
+        }
+        failures
+    }
+
+    fn apply_post_commit_policy(
+        &self,
+        post_commit_failures: Vec<(&'static str, Error)>,
+        count: usize,
+    ) -> Result<()> {
         if !post_commit_failures.is_empty() {
             let summary = post_commit_failures
                 .into_iter()
@@ -210,9 +325,11 @@ impl CdcRuntime {
             .any(|event| event.snapshot.is_some())
     }
 
-    async fn persist_snapshot_checkpoint_before_commit(&mut self, count: usize) -> Result<()> {
+    /// The committed count a bulk snapshot's own checkpoint is written at, if this prefix
+    /// owes one.
+    fn snapshot_checkpoint_target(&self, count: usize) -> Result<Option<u64>> {
         if !self.pending_prefix_contains_snapshot_events(count) {
-            return Ok(());
+            return Ok(None);
         }
 
         // Two kinds of snapshot reach this point, and only one needs a write here.
@@ -229,28 +346,22 @@ impl CdcRuntime {
         // incremental-snapshot row failed**, which made `with_incremental_snapshot`
         // unusable through `CdcRuntime` — the feature worked only when driving the
         // `StreamHandle` directly, which is what its tests did.
-        let Some(snapshot) = self.snapshot.as_ref() else {
+        if self.snapshot.is_none() {
             if self.config.incremental_snapshot.is_some() {
-                return Ok(());
+                return Ok(None);
             }
             let error = Error::StateError(
                 "snapshot events are pending commit but snapshot handle is unavailable".into(),
             );
             self.record_runtime_error("runtime.commit.snapshot_checkpoint_missing", &error);
             return Err(error);
-        };
+        }
 
-        let target_committed_count = self
-            .commit_barrier
-            .committed_event_count()
-            .saturating_add(count as u64);
-
-        snapshot
-            .checkpoint(&mut *self.config.checkpoint, target_committed_count)
-            .await
-            .inspect_err(|error| {
-                self.record_runtime_error("runtime.commit.snapshot_checkpoint", error)
-            })
+        Ok(Some(
+            self.commit_barrier
+                .committed_event_count()
+                .saturating_add(count as u64),
+        ))
     }
 
     fn committed_confirmation_lsn(&self, count: usize) -> Result<Option<u64>> {
@@ -302,5 +413,35 @@ impl CdcRuntime {
             let _ = last_committed;
             Ok(None)
         }
+    }
+}
+
+/// Routes the commit path's checkpoint writes: to the store when the cadence is due, into
+/// memory when it is not.
+struct Cadence<'a> {
+    store: &'a mut dyn Checkpoint,
+    held: &'a mut Option<(Box<dyn Offset>, u64)>,
+    defer: bool,
+}
+
+#[async_trait::async_trait]
+impl Checkpoint for Cadence<'_> {
+    async fn save(&mut self, offset: &dyn Offset, committed_event_count: u64) -> Result<()> {
+        if self.defer {
+            *self.held = Some((offset.clone_box(), committed_event_count));
+            return Ok(());
+        }
+        self.store.save(offset, committed_event_count).await?;
+        // A later position, now durable, supersedes whatever was held.
+        *self.held = None;
+        Ok(())
+    }
+
+    async fn load(&self) -> Result<Option<Box<dyn Offset>>> {
+        self.store.load().await
+    }
+
+    async fn get_committed_count(&self) -> Result<u64> {
+        self.store.get_committed_count().await
     }
 }

@@ -167,6 +167,10 @@ async fn run_with_runtime_state(
     let options = RuntimeOptions::default()
         .with_max_buffer_size(app_config.runtime.max_buffer_size)
         .with_max_poll_wait_ms(app_config.runtime.max_poll_wait_ms)
+        .with_checkpoint_interval(std::time::Duration::from_millis(
+            app_config.checkpoint_interval_ms(),
+        ))
+        .with_checkpoint_max_events(app_config.runtime.checkpoint_max_events)
         .with_transform_error_policy(match app_config.runtime.transform_error_policy {
             config::schema::RuntimeTransformErrorPolicy::Halt => TransformErrorPolicy::Halt,
             config::schema::RuntimeTransformErrorPolicy::Skip => TransformErrorPolicy::Skip,

@@ -3820,3 +3820,80 @@ fn postgres_capture_logical_messages_round_trips_and_is_optional() {
          would notice if it went inert"
     );
 }
+
+/// A Kafka pipeline under `contract`, transactional when it is `effectively_once`, with
+/// `runtime` appended as the `[runtime]` table.
+fn checkpoint_cadence_config(contract: &str, runtime: &str) -> Result<AppConfig, String> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path: PathBuf = dir.path().join("cdc.toml");
+    let transactional = if contract == "effectively_once" {
+        "delivery_mode = \"transactional\"\ntransactional_id = \"cdc-eos-1\""
+    } else {
+        ""
+    };
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+api_version = "v1alpha1"
+delivery_contract = "{contract}"
+
+[source.postgres]
+host = "localhost"
+port = 5432
+user = "cdc_user"
+password = {{ env = "CDC_TEST_SOURCE_PASSWORD" }}
+database = "mydb"
+replication_slot_name = "cdc_slot"
+publication_name = "cdc_pub"
+
+[source.postgres.transport]
+mode = "plaintext"
+
+[sink]
+type = "kafka"
+brokers = "localhost:9092"
+topic = "cdc-events"
+{transactional}
+
+[state]
+dir = "/tmp/cdc-state"
+
+[state.backend]
+kafka_topic = {{ brokers = "localhost:9092", topic = "cdc-state", min_replication_factor = 1, min_insync_replicas = 1, durability_profile = "development" }}
+
+[runtime]
+{runtime}
+"#
+        ),
+    )
+    .expect("write config");
+    load(&config_path).map_err(|error| error.to_string())
+}
+
+#[test]
+fn the_checkpoint_interval_defaults_by_delivery_contract() {
+    let at_least_once = checkpoint_cadence_config("at_least_once", "").expect("valid");
+    assert_eq!(at_least_once.checkpoint_interval_ms(), 1_000);
+    assert_eq!(at_least_once.runtime.checkpoint_max_events, 100_000);
+
+    // The position is written in each Kafka transaction, so it is never held back.
+    let effectively_once = checkpoint_cadence_config("effectively_once", "").expect("valid");
+    assert_eq!(effectively_once.checkpoint_interval_ms(), 0);
+
+    let per_batch =
+        checkpoint_cadence_config("at_least_once", "checkpoint_interval_ms = 0").expect("valid");
+    assert_eq!(per_batch.checkpoint_interval_ms(), 0);
+}
+
+#[test]
+fn effectively_once_refuses_a_checkpoint_interval() {
+    let error = checkpoint_cadence_config("effectively_once", "checkpoint_interval_ms = 500")
+        .expect_err("an interval would commit records without their position");
+    assert!(error.contains("runtime.checkpoint_interval_ms"), "{error}");
+
+    checkpoint_cadence_config("effectively_once", "checkpoint_interval_ms = 0")
+        .expect("0 is per batch, which is what effectively_once does");
+    checkpoint_cadence_config("at_least_once", "checkpoint_max_events = 0")
+        .expect_err("a cap of zero events is meaningless");
+}
