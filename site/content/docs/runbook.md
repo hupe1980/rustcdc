@@ -85,22 +85,25 @@ it names the subsystem that ended the run (`batch_delivery_error`,
 
 ## 2. Pipeline will not start
 
-### `another cdc-server process (PID N) is already running against state directory`
+### `another rustcdc process is already running against state directory`
 
-Local PID lock. Either a second process really is running, or a previous one was killed
-without cleanup.
+A second rustcdc process on this host holds the state directory's advisory lock: it really
+is running. The lock is released when its holder exits, however it exits, so there is no
+stale lock to remove; `<state-dir>/.cdc-server.lock` records the holder's PID for
+reference.
 
 ```bash
-ps -p <PID> -o pid,comm,args     # is it actually a rustcdc process?
-# If it is gone, the lock is stale and the next start overwrites it automatically.
-# If the file is orphaned on a shared volume:
-rm <state-dir>/.cdc-server.lock
+cat <state-dir>/.cdc-server.lock   # the PID of the process holding it
 ```
 
 ### `<backend> state is already owned by '<host:pid:nonce>'`
 
-Remote owner lease for the `redis` / `postgresql` state backends. Another instance holds
-it.
+Owner lease for the `local_fs`, `redis` and `postgresql` state backends. Another instance
+holds it. For `local_fs` that instance is either running (it holds the directory's lock), or its
+lease records no lock this process can check: it ran on another kernel or another mount of
+the volume, its filesystem refused the lock, or it was written before the lease recorded
+the lock. Such a lease blocks a successor until it expires (60 s). A crashed owner whose
+lock was in the same place as ours is replaced at once and does not produce this error.
 
 **The overwhelmingly common cause is a Kubernetes rolling update.** A `Deployment`
 without `strategy: Recreate` starts the new pod before stopping the old one, so both

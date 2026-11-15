@@ -62,6 +62,17 @@ pub(crate) struct LeaseRecord {
     /// Monotonic per-acquisition counter, for diagnostics and for a future fencing
     /// token if the store ever grows a CAS primitive.
     pub(crate) epoch: u64,
+    /// With [`lock_dev`](Self::lock_dev), where the owner's advisory lock is visible; see
+    /// [`crate::state::file_lock::LockDomain`].
+    ///
+    /// Written only by a `local_fs` owner that holds its directory's lock, so a successor
+    /// that takes the lock in the same domain knows this owner has exited. Absent from
+    /// every other record, including one an older version wrote, so optional both ways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot_id: Option<String>,
+    /// See [`boot_id`](Self::boot_id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lock_dev: Option<u64>,
 }
 
 impl LeaseRecord {
@@ -95,8 +106,8 @@ pub(crate) fn owner_id() -> String {
 
 /// This process's host component, as it appears in [`owner_id`].
 ///
-/// `None` when the host cannot be determined. Callers that compare hosts must treat that
-/// as "not comparable" rather than as a name — see [`HOST_UNKNOWN`].
+/// `None` when the host cannot be determined — see [`HOST_UNKNOWN`].
+#[cfg(test)]
 pub(crate) fn owner_host() -> Option<String> {
     let host = hostname();
     (host != HOST_UNKNOWN).then_some(host)
@@ -105,8 +116,8 @@ pub(crate) fn owner_host() -> Option<String> {
 /// The placeholder written into a lease when the host is genuinely unknown.
 ///
 /// It is a diagnostic string, never an identity: two machines that both fail to resolve a
-/// hostname would otherwise compare equal, and `is_dead_local_owner` would conclude that a
-/// remote owner's PID could be checked against the local process table.
+/// hostname would otherwise compare equal. Nothing decides ownership on the hostname; it
+/// names the holder in a conflict message.
 pub(crate) const HOST_UNKNOWN: &str = "unknown-host";
 
 /// Best-effort hostname, in descending order of trustworthiness.
@@ -114,10 +125,8 @@ pub(crate) const HOST_UNKNOWN: &str = "unknown-host";
 /// `$HOSTNAME` alone was the previous implementation and is not enough. It is a *shell*
 /// variable: Docker and Kubernetes export it, but a unit started by systemd, a launchd
 /// job, or anything spawned outside an interactive shell does not, so every such host
-/// resolved to the same literal `"unknown-host"`. With a state directory on a shared
-/// volume that made two different machines indistinguishable, and `is_dead_local_owner`
-/// would then check a *remote* owner's PID against the local process table — a lease steal
-/// from a live writer, which is the exact failure this module exists to prevent.
+/// resolved to the same literal `"unknown-host"`, and a conflict message named no holder
+/// an operator could find.
 fn hostname() -> String {
     fn non_empty(value: String) -> Option<String> {
         let trimmed = value.trim();
@@ -141,9 +150,7 @@ fn hostname() -> String {
                 .and_then(non_empty)
         })
         // macOS and the BSDs have neither of the above: the hostname lives in a sysctl,
-        // and without this every process on such a host resolves to `HOST_UNKNOWN`, which
-        // disables the same-host PID-liveness shortcut in `is_dead_local_owner` — so a
-        // crashed owner's lease can only ever be reclaimed by waiting out the full TTL.
+        // and without this every process on such a host resolves to `HOST_UNKNOWN`.
         // `unsafe_code` is denied here, so this reads the value through `hostname(1)`
         // rather than `gethostname(2)`. It runs once, at startup.
         .or_else(|| {
@@ -194,6 +201,8 @@ mod tests {
             owner: "host:1:abcd".to_string(),
             renewed_at_ms: 10_000,
             epoch: 1,
+            boot_id: None,
+            lock_dev: None,
         };
         assert!(record.is_live(10_000 + 59_000, LEASE_TTL));
         assert!(!record.is_live(10_000 + 61_000, LEASE_TTL));
@@ -213,6 +222,8 @@ mod tests {
             owner: "other-host:9:beef".to_string(),
             renewed_at_ms: 100_000,
             epoch: 3,
+            boot_id: None,
+            lock_dev: None,
         };
         assert!(record.is_live(90_000, LEASE_TTL));
     }
@@ -233,10 +244,8 @@ mod tests {
     ///
     /// Docker and Kubernetes export it; systemd units, launchd jobs and anything else
     /// started outside an interactive shell do not. Reading only the env var makes every
-    /// such host answer the literal `"unknown-host"` — so two machines sharing a state
-    /// volume compare equal and the same-host PID-liveness shortcut in
-    /// `is_dead_local_owner` becomes a lease steal from a live writer, while a host that
-    /// resolves to the placeholder can never reclaim a crashed owner's lease early.
+    /// such host answer the literal `"unknown-host"`, so a conflict message names no holder
+    /// an operator can find.
     ///
     /// The bar is **any** source that can name this host, not only the Linux files: an
     /// earlier version of this test checked `/proc/sys/kernel/hostname` and `/etc/hostname`
@@ -282,6 +291,8 @@ mod tests {
             owner: "rustcdc-0:7:1234abcd".to_string(),
             renewed_at_ms: 0,
             epoch: 2,
+            boot_id: None,
+            lock_dev: None,
         };
         let message = conflict_error("redis", &record, 5_000).to_string();
         assert!(message.contains("rustcdc-0:7:1234abcd"));

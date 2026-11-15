@@ -5,7 +5,7 @@ use rustcdc::core::{
     CdcRuntime, ConnectionRetryPolicy, IdempotencyOptions, PostCommitSourceConfirmPolicy,
     RuntimeConfig, RuntimeOptions, TransactionBoundaryPolicy, TransformErrorPolicy,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::pipeline::transform;
 use crate::{
@@ -557,119 +557,48 @@ fn ensure_state_layout(app_config: &AppConfig) -> Result<(), AppError> {
     Ok(())
 }
 
-// ── Advisory PID-file lock on the state directory ─────────────────────────────
-// Prevents two cdc-server processes from running against the same state dir
-// simultaneously. The lock is released automatically when the process exits via
-// the `Drop` impl.
+// ── Advisory lock on the state directory ─────────────────────────────────────
+// Refuses a second rustcdc process against the same state directory on this host, for
+// every state backend. The lock is the kernel's: released when this process exits, however
+// it exits, so it needs no PID check and no external program to tell a crash from a live
+// process.
 struct StateDirLock {
-    lock_path: PathBuf,
+    _lock: Option<crate::state::file_lock::HeldLock>,
 }
 
 impl StateDirLock {
     const LOCK_FILE: &'static str = ".cdc-server.lock";
 
-    /// Acquire the advisory lock.
-    ///
-    /// * If no lock file exists, it is created with the current PID.
-    /// * If a stale lock exists (dead PID or a different process now owns the PID), it is overwritten.
-    /// * If a live `cdc` lock exists, an error is returned with remediation guidance.
     fn acquire(state_dir: &Path) -> Result<Self, AppError> {
+        use std::io::Write as _;
+
         let lock_path = state_dir.join(Self::LOCK_FILE);
-        let my_pid = std::process::id();
-
-        if lock_path.exists() {
-            let contents = std::fs::read_to_string(&lock_path).unwrap_or_default();
-            let stored_pid: u32 = contents.trim().parse().unwrap_or(0);
-            if stored_pid > 0 && is_cdc_process_alive(stored_pid) {
-                return Err(AppError::Other(format!(
-                    "another cdc-server process (PID {stored_pid}) is already running \
-                     against state directory '{}'. \
-                     If that process has crashed, remove '{}' and retry.",
-                    state_dir.display(),
-                    lock_path.display(),
-                )));
+        match crate::state::file_lock::try_lock(&lock_path)? {
+            crate::state::file_lock::TryLock::Held(mut lock) => {
+                // For an operator reading the file; nothing decides on it. The file is not
+                // removed on exit: the lock dies with the process, and deleting a lock file
+                // races a successor that opened the old one.
+                let _ = lock.file().set_len(0);
+                let _ = writeln!(lock.file(), "{}", std::process::id());
+                tracing::debug!(path = %lock_path.display(), "acquired state-dir lock");
+                Ok(Self { _lock: Some(lock) })
             }
-            tracing::warn!(
-                "found stale state-dir lock (PID {stored_pid} is no longer alive); overwriting"
-            );
+            crate::state::file_lock::TryLock::Busy => Err(AppError::Other(format!(
+                "another rustcdc process is already running against state directory '{}' \
+                 (it holds the lock on '{}').",
+                state_dir.display(),
+                lock_path.display(),
+            ))),
+            crate::state::file_lock::TryLock::Unsupported(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %lock_path.display(),
+                    "the filesystem refused an advisory lock on the state directory; a \
+                     second process on this host is not refused by it"
+                );
+                Ok(Self { _lock: None })
+            }
         }
-
-        std::fs::write(&lock_path, my_pid.to_string()).map_err(|e| {
-            AppError::Other(format!(
-                "could not write state-dir lock '{}': {e}",
-                lock_path.display()
-            ))
-        })?;
-
-        tracing::debug!(pid = my_pid, path = %lock_path.display(), "acquired state-dir lock");
-        Ok(Self { lock_path })
-    }
-}
-
-impl Drop for StateDirLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_path);
-    }
-}
-
-/// Is a PID on **this host** a live cdc process?
-///
-/// Existence is checked with `kill -0` (no signal is sent), then the name via
-/// `/proc/{pid}/cmdline` (Linux) or `ps -o comm=` (other Unix), so a recycled PID held by
-/// an unrelated process reads as stale rather than blocking startup. Always `false` on
-/// non-Unix platforms.
-///
-/// Shared with the `local_fs` state lease, which uses it to distinguish a crashed owner
-/// from a live one *on the same host* — the one piece of evidence a local filesystem
-/// offers that a remote store does not.
-pub(crate) fn is_cdc_process_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        use std::process::{Command, Stdio};
-        let exists = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !exists {
-            return false;
-        }
-        // /proc/{pid}/cmdline contains NUL-separated argv; the first token is
-        // the executable path.  A CDC process will contain "cdc" somewhere.
-        std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
-            .map(|cmdline| cmdline.to_ascii_lowercase().contains("cdc"))
-            .unwrap_or(false)
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        use std::process::{Command, Stdio};
-        let exists = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !exists {
-            return false;
-        }
-        // `ps -o comm= -p <pid>` returns the executable name (no path).
-        Command::new("ps")
-            .args(["-o", "comm=", "-p", &pid.to_string()])
-            .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .to_ascii_lowercase()
-                    .contains("cdc")
-            })
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false // Cannot tell here, so a stale lock never blocks startup.
     }
 }
 

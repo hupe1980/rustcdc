@@ -272,9 +272,8 @@ fn the_owner_lease_record_still_parses() {
     assert_eq!(lease.epoch, 3);
     assert_eq!(lease.renewed_at_ms, 1_786_000_000_000);
 
-    // The owner id is parsed by `is_dead_local_owner` as `host:pid:nonce`. A format change
-    // that broke that would silently disable same-host crash takeover, turning every
-    // restart into a full lease-TTL stall.
+    // The owner id names the holder in a conflict message as `host:pid:nonce`, which is
+    // what the runbook tells an operator to look for.
     let parts: Vec<&str> = lease.owner.splitn(3, ':').collect();
     assert_eq!(parts.len(), 3, "the owner id must stay host:pid:nonce");
     assert!(
