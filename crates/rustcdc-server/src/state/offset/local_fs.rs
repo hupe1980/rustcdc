@@ -676,6 +676,26 @@ mod lease_tests {
         );
     }
 
+    /// A container replaced after a crash finds its predecessor's checkpoint lease, written
+    /// under another hostname, and nothing holding its lock: its first write is accepted.
+    #[tokio::test]
+    async fn a_replaced_containers_checkpoint_lease_is_taken_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkpoint_dir = dir.path().join("checkpoint");
+        std::fs::create_dir_all(&checkpoint_dir).expect("checkpoint dir");
+        std::fs::write(
+            checkpoint_dir.join(".rustcdc_checkpoint.owner"),
+            "old-container-hostname:1",
+        )
+        .expect("seed the crashed predecessor's lease");
+
+        let (mut checkpoint, _age, _owner) = build_checkpoint(dir.path()).await.expect("build");
+        checkpoint
+            .save(&PostgresOffset::new(100, "slot"), 1)
+            .await
+            .expect("a crashed predecessor in another container must not hold the checkpoint");
+    }
+
     /// A fenced instance must not release the lease it no longer holds.
     ///
     /// Otherwise shutting down a fenced-out process hands the directory to a *third*

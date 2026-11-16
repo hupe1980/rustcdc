@@ -478,17 +478,10 @@ fn uses_unsafe_keyword(code: &str) -> bool {
 fn unsafe_code_appears_only_where_the_allowlist_says_it_may() {
     /// `(file, why)`, relative to the workspace root, for both crates. A new entry needs an
     /// argument, in code review, here.
-    const ALLOWED: &[(&str, &str)] = &[
-        (
-            "crates/rustcdc-server/src/test_env.rs",
-            "the one place the server mutates process environment, serialised by EnvGuard",
-        ),
-        (
-            "crates/rustcdc/src/checkpoint/owner_lease.rs",
-            "Windows process-liveness check: the OpenProcess/CloseHandle FFI has no safe wrapper \
-             in the dependency tree",
-        ),
-    ];
+    const ALLOWED: &[(&str, &str)] = &[(
+        "crates/rustcdc-server/src/test_env.rs",
+        "the one place the server mutates process environment, serialised by EnvGuard",
+    )];
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()

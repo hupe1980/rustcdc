@@ -155,10 +155,10 @@ pub struct InMemorySchemaHistory {
 ///
 /// # Exclusive ownership
 ///
-/// On construction, `FileSchemaHistory` acquires a PID lease file at
-/// `<path>.owner` to prevent two processes from writing to the same history file
-/// simultaneously. Stale leases left by dead processes are cleared automatically;
-/// a `StateError` is returned if a live process already holds the lease.
+/// On construction, `FileSchemaHistory` takes an owner lease at `<path>.owner`, held by an
+/// advisory lock for its lifetime, so two processes never write one history file. A running
+/// owner is refused with a `StateError`; a crashed one, whatever host or PID it named, is
+/// taken over.
 #[derive(Debug, Clone)]
 pub struct FileSchemaHistory {
     path: Arc<PathBuf>,

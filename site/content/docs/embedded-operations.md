@@ -780,50 +780,28 @@ journalctl -u rustcdc -n 50 --no-pager | grep -i "error\|warn"
 curl -s http://localhost:9090/metrics | grep rustcdc_ | head -20
 ```
 
-### Checkpoint Owner-Lease Conflict Recovery
-
-Symptom example:
+### Checkpoint Owner-Lease Conflict
 
 ```text
-checkpoint owner lease conflict for '/var/rustcdc': lock owned by pid ...
+checkpoint owner lease conflict for '/var/rustcdc': a running process holds it (HOSTNAME:PID)
 ```
 
-Safe recovery steps:
+The owner holds an advisory lock beside `.rustcdc_checkpoint.owner` for as long as it runs, and
+the kernel releases it however the process exits. So this error means a process **is** running
+against the directory: find it, and stop it or give each runtime its own directory. A crashed
+owner, a restart with another PID or a replaced container with another hostname is taken over
+on the next start, with a warning naming the previous owner; there is nothing to delete.
 
 ```bash
-# 1. Confirm rustcdc process is not running.
-systemctl status rustcdc
-
-# 2. Inspect owner-lease file (if present).
-cat /var/rustcdc/.rustcdc_checkpoint.owner
-
-# 3. Verify the listed PID is not active.
-#    The lease file contains `HOSTNAME:PID`, so split it before calling `ps` —
-#    `ps -p "$(cat ...)"` errors out on the whole string.
-LEASE=$(cat /var/rustcdc/.rustcdc_checkpoint.owner)
-LEASE_HOST="${LEASE%:*}"
-LEASE_PID="${LEASE##*:}"
-echo "lease held by host=$LEASE_HOST pid=$LEASE_PID (this host: $(hostname))"
-
-if [ "$LEASE_HOST" = "$(hostname)" ]; then
-  ps -p "$LEASE_PID"        # exit 0 = still alive, do NOT remove the lease
-else
-  echo "Lease belongs to a DIFFERENT host. Do not remove it from here."
-  echo "Confirm no runtime is running on $LEASE_HOST first — two writers against one"
-  echo "checkpoint directory destroy each other's records."
-fi
-
-# 4. Only if the PID is genuinely dead on THIS host: remove the stale lease.
-#    A live process normally clears its own lease on exit, so a leftover file means
-#    the process was killed with SIGKILL or the host lost power.
-rm -f /var/rustcdc/.rustcdc_checkpoint.owner
-systemctl start rustcdc
+cat /var/rustcdc/.rustcdc_checkpoint.owner   # HOSTNAME:PID of the owner
 ```
 
-> The runtime fences writes against this file: it re-reads the lease before every durable
-> write and refuses to write if the token is no longer its own. Removing the lease while a
-> runtime is live therefore stops that runtime with a named error rather than silently
-> allowing two writers — but it still costs you an outage, so confirm liveness first.
+On a filesystem that refuses locks the error says so instead, and names the file to delete once
+you have confirmed its owner is gone.
+
+> The runtime fences writes against that file: it re-reads it before every durable write and
+> refuses to write if it no longer holds its own token. A filesystem that does not share locks
+> between hosts cannot keep two hosts apart; the fence stops the displaced one at its next write.
 
 ---
 

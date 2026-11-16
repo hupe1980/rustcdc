@@ -59,14 +59,13 @@ judge whether an allowlist argument is *true*.
 
 **Defect class.** `unsafe` appearing where nobody argued for it.
 
-**How it works.** The server binary carries `#![forbid(unsafe_code)]`, which no inner
-`#[allow]` can override. Both crates deny `unsafe_code` through `[workspace.lints]`, and the
-test scans both crates' `src/` for the `unsafe` keyword in code. Two files are allowed:
+**How it works.** The library and the server binary carry `#![forbid(unsafe_code)]`, which no
+inner `#[allow]` can override. Both crates deny `unsafe_code` through `[workspace.lints]`, and the
+test scans both crates' `src/` for the `unsafe` keyword in code. One file is allowed:
 
 | File | Why |
 |---|---|
 | `crates/rustcdc-server/src/test_env.rs` | `std::env::set_var` is `unsafe` in Rust 2024; the one place the server mutates the environment, serialised by `EnvGuard` |
-| `crates/rustcdc/src/checkpoint/owner_lease.rs` | Windows process-liveness check: the `OpenProcess`/`CloseHandle` FFI has no safe wrapper in the dependency tree |
 
 The list is checked in both directions.
 
