@@ -95,6 +95,7 @@ more than the slower detection it was meant to buy.
 | `connection_retry` | `Option<ConnectionRetryPolicy>` | enabled | Jittered exponential back-off for recoverable source connection errors. `None` propagates immediately. |
 | `sink_close_timeout_ms` | `Option<u64>` | `None` | Timeout applied to a registered sink's `close` during orderly shutdown. |
 | `transaction_boundary` | `TransactionBoundaryPolicy` | `Split` | Whether a delivered batch may end mid-transaction. See [Transaction boundaries](#transaction-boundaries). |
+| `checkpoint_commits_with_batch` | `bool` | `false` | The sink commits each batch's records with its checkpoint (effectively once). With it, or with `PreserveTransactions`, `transaction_release()` is `Whole`: a source keeps every transaction whole and fails past its buffer instead of releasing part of one. The runtime passes the answer to its source. |
 | `checkpoint_interval` | `Duration` | `ZERO` | How long an acknowledged position may wait before it is written and confirmed to the source. `ZERO`: `commit_ack` returns with it durable. Otherwise a crash replays up to one interval of acknowledged events; nothing is lost. `stop()` writes it. |
 | `checkpoint_max_events` | `u64` | 100 000 | Write after this many acknowledged events, whatever the interval. |
 
@@ -378,6 +379,10 @@ delivered partially — including when the rest is simply still in flight from t
 which for a streaming connector is the normal case rather than the exception.
 
 
+A source buffer keeps the transaction whole too: under `PreserveTransactions` the runtime tells
+its source not to release a transaction before its commit, and a PostgreSQL transaction larger
+than `transaction_buffer_bytes` stops the stream with a terminal error instead.
+
 **The one case it cannot honour.** A single transaction larger than `max_buffer_size` does not
 fit in any batch. Trimming it would produce an empty batch forever — a silent, permanent stall,
 strictly worse than the split it is trying to avoid. The runtime therefore delivers such a
@@ -532,6 +537,7 @@ it is a catch-all, not a no-op.
 | `capture_logical_messages` | `bool` | `false` | Capture `pg_logical_emit_message()` output — the table-free transactional outbox; see below. |
 | `stream_in_progress_transactions` | `bool` | `true` | Stream large transactions while they run (pgoutput v2, PostgreSQL 14+, `StreamingReplication` only). Rows are released at the commit. See [Large transactions](@/docs/connectors/postgres.md#large-transactions). |
 | `stream_buffer_memory_bytes` | `u64` | 67 108 864 | Memory for streamed, not yet committed transactions; past it one spills. Must be > 0. |
+| `transaction_buffer_bytes` | `u64` | 268 435 456 | One committed transaction's events held until its COMMIT message, by estimated serialized size. Past it they are released with `total_events: None`, or, when transactions must stay whole, the stream fails. Under `sql_peek`, which fetches whole transactions, it applies to a transaction's raw messages and the stream always fails past it. Must be > 0. See [Large transactions](@/docs/connectors/postgres.md#large-transactions). |
 | `stream_spill_directory` | `Option<PathBuf>` | system temp dir | Where streamed transactions spill. Checked writable when the stream opens. |
 
 **`create_replication_slot_if_missing` is not a convenience flag.** A slot that vanishes

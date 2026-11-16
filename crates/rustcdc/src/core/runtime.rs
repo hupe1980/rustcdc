@@ -190,6 +190,16 @@ pub struct RuntimeOptions {
     /// [`checkpoint_interval`](Self::checkpoint_interval). Bounds the replay after a crash
     /// in events as the interval bounds it in time. Default 100 000.
     pub checkpoint_max_events: u64,
+    /// Whether the sink commits each batch's records together with the checkpoint that
+    /// describes it — an effectively-once sink. Default `false`.
+    ///
+    /// Such a sink cannot take part of a source transaction: after a crash the transaction
+    /// is replayed from its start, and its first part, already committed, would be
+    /// delivered twice. Set, sources keep every transaction whole — see
+    /// [`transaction_release`](Self::transaction_release). The runtime cannot see a sink's
+    /// commit protocol, so this is the embedder's statement; leaving it unset under such a
+    /// sink exposes a large transaction to that duplication.
+    pub checkpoint_commits_with_batch: bool,
 }
 
 /// Whether a delivered batch may end in the middle of a source transaction.
@@ -263,6 +273,7 @@ impl Default for RuntimeOptions {
             max_event_bytes: None,
             sink_close_timeout_ms: None,
             transaction_boundary: TransactionBoundaryPolicy::Split,
+            checkpoint_commits_with_batch: false,
             checkpoint_interval: std::time::Duration::ZERO,
             checkpoint_max_events: DEFAULT_CHECKPOINT_MAX_EVENTS,
         }
@@ -494,6 +505,30 @@ impl RuntimeOptions {
     pub fn with_transaction_boundary(mut self, policy: TransactionBoundaryPolicy) -> Self {
         self.transaction_boundary = policy;
         self
+    }
+
+    /// State that the sink commits each batch's records with its checkpoint; see
+    /// [`checkpoint_commits_with_batch`](Self::checkpoint_commits_with_batch).
+    #[must_use]
+    pub fn with_checkpoint_commits_with_batch(mut self, commits_with_batch: bool) -> Self {
+        self.checkpoint_commits_with_batch = commits_with_batch;
+        self
+    }
+
+    /// Whether a source may release an open transaction's events before its commit, once
+    /// the transaction outgrows the source's buffer.
+    ///
+    /// Only when a partly delivered transaction can be replayed whole: batches may split
+    /// transactions, and the sink does not commit records with the checkpoint. The runtime
+    /// passes the answer to its source; one place decides, so the two cannot disagree.
+    pub fn transaction_release(&self) -> crate::source::TransactionRelease {
+        if self.checkpoint_commits_with_batch
+            || self.transaction_boundary == TransactionBoundaryPolicy::PreserveTransactions
+        {
+            crate::source::TransactionRelease::Whole
+        } else {
+            crate::source::TransactionRelease::Early
+        }
     }
 }
 
@@ -2041,6 +2076,19 @@ enum RuntimeSource {
 }
 
 impl RuntimeSource {
+    fn set_transaction_release(&mut self, release: crate::source::TransactionRelease) {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(source) => source.set_transaction_release(release),
+            #[cfg(feature = "mysql")]
+            Self::Mysql(source) => source.set_transaction_release(release),
+            #[cfg(feature = "sqlserver")]
+            Self::SqlServer(source) => source.set_transaction_release(release),
+            Self::Disabled => {}
+            Self::Custom(source) => source.set_transaction_release(release),
+        }
+    }
+
     async fn connect(&self) -> Result<()> {
         match self {
             #[cfg(feature = "postgres")]
@@ -2482,7 +2530,8 @@ impl CdcRuntime {
             retry.validate()?;
         }
 
-        let source = Self::build_source(&config)?;
+        let mut source = Self::build_source(&config)?;
+        source.set_transaction_release(config.options.transaction_release());
         let idempotency_guard = Self::build_idempotency_guard(&config.options)?;
         Ok(Self {
             commit_barrier: CommitBarrier::new(config.options.max_buffer_size),
@@ -2629,6 +2678,8 @@ impl CdcRuntime {
     /// if you need richer state.
     pub fn register_source(&mut self, source: Box<dyn crate::source::Source>) {
         self.source = RuntimeSource::Custom(source);
+        self.source
+            .set_transaction_release(self.config.options.transaction_release());
     }
 
     /// Replace the runtime source with a mock for testing.
@@ -3102,6 +3153,120 @@ mod tests {
             .unwrap();
 
         assert_eq!(checkpoint.get_committed_count().await.unwrap(), 3);
+    }
+
+    // ─── Transaction release ─────────────────────────────────────────────────
+
+    /// A source that records the transaction release the runtime gives it.
+    struct ReleaseRecordingSource {
+        release: Arc<Mutex<Option<crate::source::TransactionRelease>>>,
+    }
+
+    #[async_trait]
+    impl crate::source::Source for ReleaseRecordingSource {
+        async fn start_snapshot(
+            &mut self,
+            _tables: &[&str],
+        ) -> crate::core::Result<Box<dyn crate::source::SnapshotHandle>> {
+            Err(Error::NotImplemented("no snapshot".into()))
+        }
+
+        async fn start_stream(
+            &mut self,
+            _resume_from: Option<&dyn crate::core::Offset>,
+        ) -> crate::core::Result<Box<dyn crate::source::StreamHandle>> {
+            Err(Error::NotImplemented("no stream".into()))
+        }
+
+        async fn perform_handoff(
+            &mut self,
+            _snapshot: &mut dyn crate::source::SnapshotHandle,
+            _stream: &mut dyn crate::source::StreamHandle,
+        ) -> crate::core::Result<crate::source::HandoffResult> {
+            Err(Error::NotImplemented("no handoff".into()))
+        }
+
+        fn source_type(&self) -> &str {
+            "recording"
+        }
+
+        fn set_transaction_release(&mut self, release: crate::source::TransactionRelease) {
+            *self.release.lock().unwrap() = Some(release);
+        }
+    }
+
+    /// A transaction may reach the sink in parts only when a crash can replay it whole:
+    /// batches may split transactions, and the sink does not commit records with the
+    /// checkpoint.
+    #[test]
+    fn the_transaction_release_follows_the_commit_protocol_and_the_boundary_policy() {
+        use crate::source::TransactionRelease::{Early, Whole};
+        let options = |commits_with_batch, policy| {
+            RuntimeOptions::new()
+                .with_checkpoint_commits_with_batch(commits_with_batch)
+                .with_transaction_boundary(policy)
+        };
+        assert_eq!(
+            options(false, TransactionBoundaryPolicy::Split).transaction_release(),
+            Early
+        );
+        assert_eq!(
+            options(true, TransactionBoundaryPolicy::Split).transaction_release(),
+            Whole,
+            "a sink that commits records with the checkpoint cannot take part of a transaction"
+        );
+        assert_eq!(
+            options(false, TransactionBoundaryPolicy::PreserveTransactions).transaction_release(),
+            Whole,
+            "batches that must hold whole transactions cannot take part of one"
+        );
+        assert_eq!(RuntimeOptions::default().transaction_release(), Early);
+    }
+
+    /// The runtime tells the source it takes, before any stream starts.
+    #[test]
+    fn a_registered_source_is_told_the_transaction_release() {
+        for (policy, expected) in [
+            (
+                TransactionBoundaryPolicy::Split,
+                crate::source::TransactionRelease::Early,
+            ),
+            (
+                TransactionBoundaryPolicy::PreserveTransactions,
+                crate::source::TransactionRelease::Whole,
+            ),
+        ] {
+            let mut runtime = transaction_boundary_runtime(policy, 16);
+            let release = Arc::new(Mutex::new(None));
+            runtime.register_source(Box::new(ReleaseRecordingSource {
+                release: Arc::clone(&release),
+            }));
+            assert_eq!(*release.lock().unwrap(), Some(expected));
+        }
+    }
+
+    /// The PostgreSQL source the runtime builds from its configuration is told too.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn the_built_postgres_source_is_told_the_transaction_release() {
+        for (commits_with_batch, expected) in [
+            (false, crate::source::TransactionRelease::Early),
+            (true, crate::source::TransactionRelease::Whole),
+        ] {
+            let config = RuntimeConfig::new(
+                RuntimeSourceConfig::postgres(crate::source::PostgresSourceConfig::default()),
+                InMemoryCheckpoint::default(),
+                crate::schema_history::InMemorySchemaHistory::default(),
+            )
+            .with_options(
+                RuntimeOptions::new().with_checkpoint_commits_with_batch(commits_with_batch),
+            );
+            let runtime = CdcRuntime::new(config).unwrap();
+            let super::RuntimeSource::Postgres(source) = &runtime.source else {
+                panic!("a postgres configuration builds a postgres source");
+            };
+            assert_eq!(source.transaction_release(), expected);
+        }
     }
 
     // ─── Transaction-boundary policy ─────────────────────────────────────────

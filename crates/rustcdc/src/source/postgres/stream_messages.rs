@@ -231,7 +231,7 @@ impl PostgresStreamHandle {
         self.current_xid.map(|xid| TransactionMetadata {
             tx_id: u64::from(xid),
             total_events: None,
-            event_index: self.partial_tx_events.len() as u32,
+            event_index: self.tx_buffer.next_index(),
         })
     }
 
@@ -561,6 +561,14 @@ impl PostgresStreamHandle {
         }
     }
 
+    /// Hold an event of the open transaction, releasing what the buffer gives back.
+    fn hold(&mut self, event: Event, released: &mut Vec<Event>) -> Result<()> {
+        let early = self.tx_buffer.push(event)?;
+        self.events_polled = self.events_polled.saturating_add(early.len() as u64);
+        released.extend(early);
+        Ok(())
+    }
+
     pub(super) async fn process_messages(
         &mut self,
         xlog_data: Vec<PgOutputXLogData>,
@@ -575,7 +583,7 @@ impl PostgresStreamHandle {
                             target: "rustcdc::source::postgres",
                             prev_xid = ?self.current_xid,
                             new_xid = begin.xid,
-                            partial_events_discarded = self.partial_tx_events.len(),
+                            partial_events_discarded = self.tx_buffer.len(),
                             "received BEGIN while a transaction was already in-flight; \
                              discarding partial events — possible stream reset or protocol edge case",
                         );
@@ -583,7 +591,7 @@ impl PostgresStreamHandle {
                     self.current_xid = Some(begin.xid);
                     self.current_commit_ts = pg_timestamp_to_millis(begin.commit_timestamp_us);
                     self.current_tx_start = self.resume_floor;
-                    self.partial_tx_events.clear();
+                    self.tx_buffer.begin();
                 }
                 PgOutputMessage::Commit(commit) => {
                     self.stream.lsn_position = commit.end_lsn;
@@ -600,13 +608,9 @@ impl PostgresStreamHandle {
                             self.committed_tx_ends.pop_front();
                         }
                     }
-                    let total = self.partial_tx_events.len() as u32;
-                    for event in &mut self.partial_tx_events {
-                        if let Some(tx) = event.transaction.as_mut() {
-                            tx.total_events = Some(total);
-                        }
-                    }
-                    self.events_polled += u64::from(total);
+                    let mut held = self.tx_buffer.commit();
+                    let total = held.len();
+                    self.events_polled += total as u64;
                     tracing::trace!(
                         target: "rustcdc::source::postgres",
                         tx_id = self.current_xid,
@@ -614,7 +618,7 @@ impl PostgresStreamHandle {
                         event_count = total,
                         "postgres transaction committed",
                     );
-                    committed.append(&mut self.partial_tx_events);
+                    committed.append(&mut held);
                     self.current_xid = None;
                     self.current_commit_ts = 0;
                 }
@@ -720,7 +724,7 @@ impl PostgresStreamHandle {
                             self.build_relation_schema_change_event(&rel, table_schema, item.lsn);
                         if self.current_xid.is_some() {
                             schema_event.transaction = self.tx_meta();
-                            self.partial_tx_events.push(schema_event);
+                            self.hold(schema_event, &mut committed)?;
                         } else {
                             self.events_polled = self.events_polled.saturating_add(1);
                             self.raise_resume_floor_to(&schema_event);
@@ -747,7 +751,7 @@ impl PostgresStreamHandle {
                         // outside any transaction's fate, so holding it until a commit
                         // that may never come would strand it.
                         if message.transactional && self.current_xid.is_some() {
-                            self.partial_tx_events.push(event);
+                            self.hold(event, &mut committed)?;
                         } else {
                             self.events_polled = self.events_polled.saturating_add(1);
                             self.raise_resume_floor_to(&event);
@@ -766,7 +770,7 @@ impl PostgresStreamHandle {
                     ) {
                         {
                             let event = self.build_insert_event(&insert, item.lsn)?;
-                            self.partial_tx_events.push(event);
+                            self.hold(event, &mut committed)?;
                         }
                     }
                 }
@@ -781,7 +785,7 @@ impl PostgresStreamHandle {
                     ) {
                         {
                             let event = self.build_update_event(&update, item.lsn)?;
-                            self.partial_tx_events.push(event);
+                            self.hold(event, &mut committed)?;
                         }
                     }
                 }
@@ -796,7 +800,7 @@ impl PostgresStreamHandle {
                     ) {
                         {
                             let event = self.build_delete_event(&delete, item.lsn)?;
-                            self.partial_tx_events.push(event);
+                            self.hold(event, &mut committed)?;
                         }
                     }
                 }
@@ -809,7 +813,7 @@ impl PostgresStreamHandle {
                             &self.table_include_list,
                             &self.table_exclude_list,
                         ) {
-                            self.partial_tx_events.push(event);
+                            self.hold(event, &mut committed)?;
                         }
                     }
                 }

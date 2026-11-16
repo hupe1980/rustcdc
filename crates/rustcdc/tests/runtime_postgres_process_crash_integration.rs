@@ -684,8 +684,21 @@ async fn runtime_postgres_process_kill_mid_stream_loses_no_committed_row() -> ru
 #[tokio::test]
 async fn runtime_postgres_process_kill_after_the_first_batch_of_a_large_transaction_loses_no_row()
 -> rustcdc::Result<()> {
-    kill_after_the_first_batch_of_a_large_transaction(true).await
+    kill_after_the_first_batch_of_a_large_transaction(true, None).await
 }
+
+/// The same, with the transaction larger than the decoder's buffer: its first events are
+/// released before the decoder reads its commit, and acknowledging them checkpoints from
+/// where the transaction began. A restart, which releases early as well, resends all of it.
+#[tokio::test]
+async fn runtime_postgres_process_kill_after_an_early_released_batch_of_a_large_transaction_loses_no_row()
+-> rustcdc::Result<()> {
+    kill_after_the_first_batch_of_a_large_transaction(true, Some(TRANSACTION_BUFFER_BYTES)).await
+}
+
+/// Small enough that the 3,000-row transaction outgrows it many times over: each of its
+/// events estimates at about 180 bytes.
+const TRANSACTION_BUFFER_BYTES: u64 = 16 * 1024;
 
 /// The same, starting with no checkpoint while the slot already holds the transaction: the
 /// stream begins at the slot's `confirmed_flush_lsn`, and that — not the WAL head, which is
@@ -693,11 +706,12 @@ async fn runtime_postgres_process_kill_after_the_first_batch_of_a_large_transact
 #[tokio::test]
 async fn runtime_postgres_process_kill_after_the_first_batch_of_a_backlogged_transaction_without_a_checkpoint_loses_no_row()
 -> rustcdc::Result<()> {
-    kill_after_the_first_batch_of_a_large_transaction(false).await
+    kill_after_the_first_batch_of_a_large_transaction(false, None).await
 }
 
 async fn kill_after_the_first_batch_of_a_large_transaction(
     seed_checkpoint: bool,
+    transaction_buffer_bytes: Option<u64>,
 ) -> rustcdc::Result<()> {
     if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping postgres large-transaction crash test (set CDC_RS_RUN_DOCKER_TESTS=1)");
@@ -778,7 +792,7 @@ async fn kill_after_the_first_batch_of_a_large_transaction(
         .map_err(|e| error(&e))?;
 
     let marker_file = checkpoint_dir.path().join("worker-large-tx.marker");
-    let mut worker = spawn_crash_worker(
+    let mut command = crash_worker_command(
         &host,
         port,
         checkpoint_dir.path(),
@@ -792,6 +806,10 @@ async fn kill_after_the_first_batch_of_a_large_transaction(
         // checkpoint and confirms the slot, which is the write this test is about.
         None,
     )?;
+    if let Some(limit) = transaction_buffer_bytes {
+        command.env("CDC_RS_WORKER_TRANSACTION_BUFFER_BYTES", limit.to_string());
+    }
+    let mut worker = command.spawn().map_err(rustcdc::Error::IoError)?;
     wait_for_marker(&marker_file, Duration::from_secs(90))?;
     let acked = read_worker_batch_len(&marker_file)?;
     assert!(
@@ -801,6 +819,14 @@ async fn kill_after_the_first_batch_of_a_large_transaction(
     worker.kill().map_err(rustcdc::Error::IoError)?;
     let _ = worker.wait().map_err(rustcdc::Error::IoError)?;
     wait_for_slot_released(&admin, "large_tx_slot").await?;
+    if transaction_buffer_bytes.is_some() {
+        let marker = std::fs::read_to_string(&marker_file).map_err(rustcdc::Error::IoError)?;
+        assert!(
+            marker.contains(&format!("unknown_totals={acked}\n")),
+            "every acknowledged event must have been released before the commit was read: \
+             {marker}"
+        );
+    }
 
     let mut runtime = CdcRuntime::new(
         RuntimeConfig::new(
@@ -815,6 +841,8 @@ async fn kill_after_the_first_batch_of_a_large_transaction(
                 stream_poll_interval_ms: 50,
                 max_events_per_poll: 1_000,
                 transport: rustcdc::TransportConfig::plaintext(),
+                transaction_buffer_bytes: transaction_buffer_bytes
+                    .unwrap_or_else(PostgresSourceConfig::default_transaction_buffer_bytes),
                 ..PostgresSourceConfig::default()
             }),
             FileCheckpoint::new(checkpoint_dir.path()),
@@ -855,6 +883,267 @@ async fn kill_after_the_first_batch_of_a_large_transaction(
         ROWS - delivered
     );
     Ok(())
+}
+
+/// A pipeline that must keep transactions whole fails at the buffer limit, naming it,
+/// rather than holding the transaction until memory runs out.
+///
+/// `PreserveTransactions` stands in for every such pipeline: the runtime derives the same
+/// mode from a sink that commits records with the checkpoint.
+#[tokio::test]
+async fn runtime_postgres_whole_transaction_past_the_buffer_limit_fails_with_the_limit_named()
+-> rustcdc::Result<()> {
+    let Some(message) = transaction_past_the_buffer_limit(
+        rustcdc::WalTransport::StreamingReplication,
+        rustcdc::TransactionBoundaryPolicy::PreserveTransactions,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    assert!(message.contains("transaction_buffer_bytes"), "{message}");
+    Ok(())
+}
+
+/// Under `sql_peek` every peek returns whole transactions, so one larger than the limit
+/// cannot be fetched in parts: the stream fails, naming the limit and the transport that
+/// can, even where the pipeline would allow an early release — rather than collecting the
+/// whole transaction in memory.
+#[tokio::test]
+async fn runtime_postgres_sql_peek_transaction_past_the_buffer_limit_fails_with_the_limit_named()
+-> rustcdc::Result<()> {
+    let Some(message) = transaction_past_the_buffer_limit(
+        rustcdc::WalTransport::SqlPeek,
+        rustcdc::TransactionBoundaryPolicy::Split,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    assert!(message.contains("transaction_buffer_bytes"), "{message}");
+    assert!(message.contains("streaming_replication"), "{message}");
+    Ok(())
+}
+
+/// Standalone logical messages belong to no transaction, so under `sql_peek` they never add
+/// up to one: a backlog of many small ones, together past the limit, is delivered whole —
+/// after a transaction too, whose COMMIT ends what counts.
+#[tokio::test]
+async fn runtime_postgres_sql_peek_standalone_messages_do_not_count_as_one_transaction()
+-> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping postgres standalone-message test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+    const MESSAGES: usize = 32;
+    let error = |error: &dyn std::error::Error| rustcdc::Error::SourceError(error.to_string());
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec!["postgres", "-c", "wal_level=logical"])
+        .start()
+        .await
+        .map_err(|e| error(&e))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|e| error(&e))?
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|e| error(&e))?;
+    let (admin, connection) = tokio_postgres::connect(
+        &format!("host={host} port={port} user=postgres password=postgres dbname=cdc"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .map_err(|e| error(&e))?;
+    tokio::spawn(connection);
+    for statement in [
+        "CREATE TABLE public.messages_tx (id BIGINT PRIMARY KEY)",
+        "CREATE PUBLICATION messages_pub FOR TABLE public.messages_tx",
+        "SELECT pg_create_logical_replication_slot('messages_slot', 'pgoutput')",
+    ] {
+        admin
+            .batch_execute(statement)
+            .await
+            .map_err(|e| error(&e))?;
+    }
+    admin
+        .batch_execute("INSERT INTO public.messages_tx VALUES (1)")
+        .await
+        .map_err(|e| error(&e))?;
+    // Each about 1 KiB; together twice the 16 KiB limit.
+    for _ in 0..MESSAGES {
+        admin
+            .batch_execute("SELECT pg_logical_emit_message(false, 'probe', repeat('x', 1024))")
+            .await
+            .map_err(|e| error(&e))?;
+    }
+    admin
+        .batch_execute("INSERT INTO public.messages_tx VALUES (2)")
+        .await
+        .map_err(|e| error(&e))?;
+
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
+    let mut runtime = CdcRuntime::new(
+        RuntimeConfig::new(
+            RuntimeSourceConfig::Postgres(PostgresSourceConfig {
+                host,
+                port,
+                user: "postgres".to_string(),
+                password: "postgres".into(),
+                database: "cdc".to_string(),
+                replication_slot_name: "messages_slot".to_string(),
+                publication_name: "messages_pub".to_string(),
+                stream_poll_interval_ms: 50,
+                transport: rustcdc::TransportConfig::plaintext(),
+                transaction_buffer_bytes: TRANSACTION_BUFFER_BYTES,
+                wal_transport: rustcdc::WalTransport::SqlPeek,
+                capture_logical_messages: true,
+                ..PostgresSourceConfig::default()
+            }),
+            FileCheckpoint::new(checkpoint_dir.path()),
+            InMemorySchemaHistory::default(),
+        )
+        .with_max_poll_wait_ms(150),
+    )?;
+    runtime.start().await?;
+
+    let (mut messages, mut rows) = (0, 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while (messages < MESSAGES || rows < 2) && std::time::Instant::now() < deadline {
+        let batch = runtime.poll_event_batch().await?;
+        messages += batch
+            .events()
+            .iter()
+            .filter(|event| event.op == Operation::Message)
+            .count();
+        rows += batch
+            .events()
+            .iter()
+            .filter(|event| event.op == Operation::Insert)
+            .count();
+        runtime.commit_ack(batch.ack_mode()).await?;
+    }
+    assert_eq!(
+        (messages, rows),
+        (MESSAGES, 2),
+        "every standalone message and both rows are delivered"
+    );
+    Ok(())
+}
+
+/// Run a 3,000-row transaction against a 16 KiB buffer and return the terminal error the
+/// stream stops with, or `None` when container tests are off. No row may be released first.
+async fn transaction_past_the_buffer_limit(
+    wal_transport: rustcdc::WalTransport,
+    boundary: rustcdc::TransactionBoundaryPolicy,
+) -> rustcdc::Result<Option<String>> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping postgres transaction-buffer limit test (set CDC_RS_RUN_DOCKER_TESTS=1)"
+        );
+        return Ok(None);
+    }
+    let error = |error: &dyn std::error::Error| rustcdc::Error::SourceError(error.to_string());
+    let container = GenericImage::new("postgres", matrix::full(matrix::Engine::Postgres))
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_DB", "cdc")
+        .with_cmd(vec!["postgres", "-c", "wal_level=logical"])
+        .start()
+        .await
+        .map_err(|e| error(&e))?;
+    let host = container
+        .get_host()
+        .await
+        .map_err(|e| error(&e))?
+        .to_string();
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .map_err(|e| error(&e))?;
+    let (admin, connection) = tokio_postgres::connect(
+        &format!("host={host} port={port} user=postgres password=postgres dbname=cdc"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .map_err(|e| error(&e))?;
+    tokio::spawn(connection);
+    // One statement each: a multi-statement string runs as one transaction, and a slot
+    // cannot be created in a transaction that has written.
+    for statement in [
+        "CREATE TABLE public.whole_tx (id BIGINT PRIMARY KEY, v TEXT)",
+        "CREATE PUBLICATION whole_tx_pub FOR TABLE public.whole_tx",
+        "SELECT pg_create_logical_replication_slot('whole_tx_slot', 'pgoutput')",
+        "INSERT INTO public.whole_tx SELECT g, 'row ' || g FROM generate_series(1, 3000) g",
+    ] {
+        admin
+            .batch_execute(statement)
+            .await
+            .map_err(|e| error(&e))?;
+    }
+
+    let checkpoint_dir = tempfile::tempdir().map_err(rustcdc::Error::IoError)?;
+    let mut runtime = CdcRuntime::new(
+        RuntimeConfig::new(
+            RuntimeSourceConfig::Postgres(PostgresSourceConfig {
+                host,
+                port,
+                user: "postgres".to_string(),
+                password: "postgres".into(),
+                database: "cdc".to_string(),
+                replication_slot_name: "whole_tx_slot".to_string(),
+                publication_name: "whole_tx_pub".to_string(),
+                stream_poll_interval_ms: 50,
+                transport: rustcdc::TransportConfig::plaintext(),
+                transaction_buffer_bytes: TRANSACTION_BUFFER_BYTES,
+                wal_transport,
+                ..PostgresSourceConfig::default()
+            }),
+            FileCheckpoint::new(checkpoint_dir.path()),
+            InMemorySchemaHistory::default(),
+        )
+        .with_options(rustcdc::RuntimeOptions::new().with_transaction_boundary(boundary))
+        .with_max_poll_wait_ms(150),
+    )?;
+    runtime.start().await?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let failure = loop {
+        match runtime.poll_event_batch().await {
+            Err(failure) => break failure,
+            Ok(batch) => {
+                assert!(
+                    batch
+                        .events()
+                        .iter()
+                        .all(|event| event.op != Operation::Insert),
+                    "no part of the transaction may be released"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the stream never reached the limit"
+                );
+            }
+        }
+    };
+    let message = failure.to_string();
+    assert_eq!(
+        failure.kind(),
+        rustcdc::core::ErrorKind::Terminal,
+        "{message}"
+    );
+    Ok(Some(message))
 }
 
 /// Block until PostgreSQL has released `slot`, or fail with a message that says why.
@@ -913,6 +1202,35 @@ fn spawn_crash_worker(
     until_streaming: bool,
     checkpoint_interval_ms: Option<u64>,
 ) -> rustcdc::Result<Child> {
+    crash_worker_command(
+        host,
+        port,
+        checkpoint_dir,
+        marker_file,
+        slot,
+        publication,
+        snapshot_table,
+        ack_first_batch,
+        until_streaming,
+        checkpoint_interval_ms,
+    )?
+    .spawn()
+    .map_err(rustcdc::Error::IoError)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn crash_worker_command(
+    host: &str,
+    port: u16,
+    checkpoint_dir: &Path,
+    marker_file: &Path,
+    slot: &str,
+    publication: &str,
+    snapshot_table: Option<&str>,
+    ack_first_batch: bool,
+    until_streaming: bool,
+    checkpoint_interval_ms: Option<u64>,
+) -> rustcdc::Result<Command> {
     let worker_bin = resolve_worker_bin()?;
 
     let mut command = Command::new(worker_bin);
@@ -943,7 +1261,7 @@ fn spawn_crash_worker(
             interval_ms.to_string(),
         );
     }
-    command.spawn().map_err(rustcdc::Error::IoError)
+    Ok(command)
 }
 
 fn resolve_worker_bin() -> rustcdc::Result<PathBuf> {

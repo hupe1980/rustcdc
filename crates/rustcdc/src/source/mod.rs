@@ -19,6 +19,7 @@ pub mod snapshot_tracker;
 pub mod snapshot_validator;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
+pub mod transaction_buffer;
 
 pub use incremental_snapshot::{
     BracketPosition, ChunkRow, IncrementalSnapshotBackend, IncrementalSnapshotDriver, SnapshotTable,
@@ -30,6 +31,7 @@ pub use incremental_snapshot::{
 pub use snapshot_progress::{SnapshotCheckpointHelper, SnapshotProgress, TableProgress};
 pub use snapshot_tracker::{SnapshotProgressTracker, SnapshotTrackerConfig, SnapshotTrackerReport};
 pub use snapshot_validator::{SnapshotValidationResult, SnapshotValidator};
+pub use transaction_buffer::TransactionRelease;
 
 /// Authentication mode for database source connectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -645,8 +647,9 @@ pub trait StreamHandle: Send + Sync {
     /// not yet delivered, which a crash then loses. The PostgreSQL handle returns `end_lsn`
     /// for the last event and, for every other, the highest position the stream had reached
     /// at the transaction's BEGIN (its start, a committed end, or a standalone event's own
-    /// offset) — so a restart part-way through replays the whole transaction. A handle that
-    /// wraps another stream must forward this.
+    /// offset) — including an event released before the handle read the COMMIT, because the
+    /// transaction outgrew its buffer — so a restart part-way through replays the whole
+    /// transaction. A handle that wraps another stream must forward this.
     ///
     /// *Limit:* the PostgreSQL handle remembers the boundaries of the last 100,000
     /// transactions not yet confirmed. Past that it returns `None` for an evicted transaction's
@@ -809,6 +812,14 @@ pub trait Source: Send + Sync {
     /// on an already-closed source, and must not block indefinitely — the runtime
     /// applies its own timeout but a hung `close` still delays shutdown.
     async fn close(&self) {}
+
+    /// Whether an open transaction that outgrows the source's buffer may be released
+    /// before its commit. The runtime calls this when it takes the source, before any
+    /// stream starts, with [`RuntimeOptions::transaction_release`](crate::core::RuntimeOptions::transaction_release).
+    ///
+    /// A source that holds transactions until their commit honours it; one that does not
+    /// buffer ignores it, which is the default. A source that wraps another must forward it.
+    fn set_transaction_release(&mut self, _release: TransactionRelease) {}
 }
 
 #[cfg(feature = "mariadb")]

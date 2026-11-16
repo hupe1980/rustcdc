@@ -324,6 +324,10 @@ where
     fn source_type(&self) -> &str {
         self.inner.source_type()
     }
+
+    fn set_transaction_release(&mut self, release: crate::source::TransactionRelease) {
+        self.inner.set_transaction_release(release);
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +435,7 @@ mod tests {
     struct MockSource {
         snapshot_chunks: VecDeque<Vec<Event>>,
         stream_batches: VecDeque<Vec<Event>>,
+        release: Option<crate::source::TransactionRelease>,
     }
 
     #[async_trait]
@@ -466,12 +471,33 @@ mod tests {
         fn source_type(&self) -> &str {
             "mock"
         }
+
+        fn set_transaction_release(&mut self, release: crate::source::TransactionRelease) {
+            self.release = Some(release);
+        }
+    }
+
+    /// The wrapper forwards the transaction release; dropping it would leave the wrapped
+    /// source on its own default, whatever the runtime decided.
+    #[test]
+    fn the_transaction_release_reaches_the_wrapped_source() {
+        let mut wrapped = FaultInjectingSource::new(MockSource {
+            snapshot_chunks: VecDeque::new(),
+            release: None,
+            stream_batches: VecDeque::new(),
+        });
+        wrapped.set_transaction_release(crate::source::TransactionRelease::Early);
+        assert_eq!(
+            wrapped.inner.release,
+            Some(crate::source::TransactionRelease::Early)
+        );
     }
 
     #[tokio::test]
     async fn fault_injected_at_correct_point() {
         let source = MockSource {
             snapshot_chunks: VecDeque::new(),
+            release: None,
             stream_batches: VecDeque::from(vec![
                 vec![event(1), event(2)],
                 vec![event(3), event(4)],
@@ -491,6 +517,7 @@ mod tests {
     async fn multiple_faults_are_stackable() {
         let source = MockSource {
             snapshot_chunks: VecDeque::new(),
+            release: None,
             stream_batches: VecDeque::from(vec![vec![event(1), event(2)]]),
         };
         let mut wrapped = FaultInjectingSource::new(source);
@@ -512,6 +539,7 @@ mod tests {
     async fn connection_fault_returns_error() {
         let source = MockSource {
             snapshot_chunks: VecDeque::new(),
+            release: None,
             stream_batches: VecDeque::from(vec![vec![event(1)]]),
         };
         let mut wrapped = FaultInjectingSource::new(source);
@@ -529,6 +557,7 @@ mod tests {
     async fn corruption_fault_is_detectable() {
         let source = MockSource {
             snapshot_chunks: VecDeque::new(),
+            release: None,
             stream_batches: VecDeque::from(vec![vec![event(1), event(2), event(3)]]),
         };
         let mut wrapped = FaultInjectingSource::new(source);

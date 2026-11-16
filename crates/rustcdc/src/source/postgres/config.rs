@@ -71,6 +71,7 @@ impl Default for PostgresSourceConfig {
             stream_in_progress_transactions: Self::default_stream_in_progress_transactions(),
             stream_buffer_memory_bytes: Self::default_stream_buffer_memory_bytes(),
             stream_spill_directory: None,
+            transaction_buffer_bytes: Self::default_transaction_buffer_bytes(),
         }
     }
 }
@@ -111,6 +112,11 @@ impl PostgresSourceConfig {
     /// 64 MiB of streamed transactions in memory before one spills.
     pub const fn default_stream_buffer_memory_bytes() -> u64 {
         64 * 1024 * 1024
+    }
+
+    /// 256 MiB of one open transaction's events held before its commit.
+    pub const fn default_transaction_buffer_bytes() -> u64 {
+        256 * 1024 * 1024
     }
 
     /// The directory streamed transactions spill to.
@@ -225,6 +231,11 @@ impl PostgresSourceConfig {
         if self.max_events_per_poll == 0 {
             return Err(Error::ConfigError(
                 "postgres max_events_per_poll must be greater than zero".into(),
+            ));
+        }
+        if self.transaction_buffer_bytes == 0 {
+            return Err(Error::ConfigError(
+                "postgres transaction_buffer_bytes must be greater than zero".into(),
             ));
         }
         if self.stream_buffer_memory_bytes == 0 {

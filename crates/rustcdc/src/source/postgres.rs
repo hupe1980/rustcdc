@@ -112,7 +112,8 @@ pub struct PostgresStreamHandle {
     warned_unknown_messages: std::collections::HashSet<u8>,
     current_xid: Option<u32>,
     current_commit_ts: u64,
-    partial_tx_events: Vec<Event>,
+    /// The open transaction's events not yet released.
+    tx_buffer: crate::source::transaction_buffer::TransactionBuffer,
     /// The last committed end read before the open transaction's BEGIN: where a restart
     /// resumes from while that transaction has not been delivered whole.
     current_tx_start: u64,
@@ -226,7 +227,10 @@ impl PostgresStreamHandle {
             warned_unknown_messages: std::collections::HashSet::new(),
             current_xid: None,
             current_commit_ts: 0,
-            partial_tx_events: Vec::new(),
+            tx_buffer: crate::source::transaction_buffer::TransactionBuffer::new(
+                PostgresSourceConfig::default_transaction_buffer_bytes(),
+                crate::source::TransactionRelease::Whole,
+            ),
             current_tx_start: 0,
             resume_floor,
             committed_tx_ends: std::collections::VecDeque::new(),
@@ -255,6 +259,16 @@ impl PostgresStreamHandle {
     /// already holds commits between the two.
     fn with_resume_floor(mut self, lsn: u64) -> Self {
         self.resume_floor = lsn;
+        self
+    }
+
+    fn with_transaction_buffer(
+        mut self,
+        limit_bytes: u64,
+        release: crate::source::TransactionRelease,
+    ) -> Self {
+        self.tx_buffer =
+            crate::source::transaction_buffer::TransactionBuffer::new(limit_bytes, release);
         self
     }
 
@@ -778,6 +792,17 @@ pub struct PostgresSourceConfig {
     /// Default: unset, the system temporary directory.
     #[serde(default)]
     pub stream_spill_directory: Option<std::path::PathBuf>,
+    /// Bytes of one open transaction's decoded events held until its commit, measured as
+    /// their estimated serialized size.
+    ///
+    /// A transaction's events are released together at its commit, which is when its size
+    /// is known. Past this limit, a stream that may deliver a transaction in parts releases
+    /// its events as they come, with `total_events: None`; one that must keep it whole
+    /// fails instead of growing without bound. See [`crate::source::TransactionRelease`].
+    ///
+    /// Default: 256 MiB.
+    #[serde(default = "PostgresSourceConfig::default_transaction_buffer_bytes")]
+    pub transaction_buffer_bytes: u64,
 }
 
 /// How the connector reads the WAL stream from PostgreSQL.
@@ -827,6 +852,8 @@ pub enum WalTransport {
 /// PostgreSQL connector lifecycle manager.
 pub struct PostgresConnection {
     config: PostgresSourceConfig,
+    /// Set by the runtime before each stream start; see [`Source::set_transaction_release`].
+    transaction_release: crate::source::TransactionRelease,
     logger: StructuredLogger,
     state: Arc<Mutex<ConnectionState>>,
     stream_poll_interval_ms: u64,
@@ -842,12 +869,19 @@ impl PostgresConnection {
         let slot_idle_advance_interval_ms = config.slot_idle_advance_interval_ms;
         Self {
             config,
+            transaction_release: crate::source::TransactionRelease::Whole,
             logger: StructuredLogger::new("postgres"),
             state: Arc::new(Mutex::new(ConnectionState::default())),
             stream_poll_interval_ms,
             max_events_per_poll,
             slot_idle_advance_interval_ms,
         }
+    }
+
+    /// The transaction release the runtime last gave this source.
+    #[cfg(test)]
+    pub(crate) fn transaction_release(&self) -> crate::source::TransactionRelease {
+        self.transaction_release
     }
 
     /// Build a connection with a caller-supplied structured logger.
@@ -857,6 +891,7 @@ impl PostgresConnection {
         let slot_idle_advance_interval_ms = config.slot_idle_advance_interval_ms;
         Self {
             config,
+            transaction_release: crate::source::TransactionRelease::Whole,
             logger,
             state: Arc::new(Mutex::new(ConnectionState::default())),
             stream_poll_interval_ms,
@@ -1080,6 +1115,10 @@ impl Source for PostgresConnection {
 
     fn source_type(&self) -> &str {
         PostgresSourceConfig::source_type()
+    }
+
+    fn set_transaction_release(&mut self, release: crate::source::TransactionRelease) {
+        self.transaction_release = release;
     }
 
     fn capabilities(&self) -> ConnectorCapabilities {
@@ -1348,14 +1387,19 @@ impl StreamHandle for PostgresStreamHandle {
         // highest position already checkpointable, and before the commit record, so a restart
         // replays the whole transaction.
         //
-        // Every event released by the decoder belongs to a transaction whose COMMIT has
-        // already been read, so the lookup always hits for an event this handle produced.
+        // An event of a transaction still open — released before its commit because the
+        // transaction outgrew the buffer — resumes from that same start: it cannot be the
+        // last, which is held until the commit.
         let tx = event.transaction.as_ref()?;
-        let (start_lsn, end_lsn) = self
+        let Some((start_lsn, end_lsn)) = self
             .committed_tx_ends
             .iter()
             .rev()
-            .find_map(|&(id, start, end)| (id == tx.tx_id).then_some((start, end)))?;
+            .find_map(|&(id, start, end)| (id == tx.tx_id).then_some((start, end)))
+        else {
+            return (self.current_xid.map(u64::from) == Some(tx.tx_id))
+                .then(|| parser::format_pg_lsn(self.current_tx_start));
+        };
         let last_of_transaction = tx
             .total_events
             .is_some_and(|total| tx.event_index.saturating_add(1) >= total);
@@ -2050,6 +2094,257 @@ mod tests {
             ],
             "a batch cut inside a transaction must not resume past it"
         );
+    }
+
+    /// The bounded transaction buffer: what an open transaction larger than
+    /// `transaction_buffer_bytes` does, under each [`crate::source::TransactionRelease`].
+    mod transaction_buffer_tests {
+        use super::*;
+        use crate::source::TransactionRelease;
+
+        const OID: u32 = 16384;
+        /// About two of these tests' events: each estimates at roughly 160 bytes.
+        const SMALL_LIMIT: u64 = 400;
+
+        /// BEGIN and six inserts of transaction 7, with no COMMIT yet.
+        fn open_transaction() -> Vec<PgOutputXLogData> {
+            let mut frames = vec![
+                xlog(100, build_relation(OID, "public", "t", &[("id", true)])),
+                xlog(200, build_begin(900, 0, 7)),
+            ];
+            for id in 1..=6u64 {
+                let value = id.to_string();
+                frames.push(xlog(
+                    200 + id * 10,
+                    build_insert(OID, &[Some(value.as_str())]),
+                ));
+            }
+            frames
+        }
+
+        fn ids(events: &[crate::core::Event]) -> Vec<String> {
+            events
+                .iter()
+                .map(|event| event.after.as_ref().expect("a row")["id"].to_string())
+                .collect()
+        }
+
+        fn handle(
+            batches: Vec<Vec<PgOutputXLogData>>,
+            release: TransactionRelease,
+        ) -> PostgresStreamHandle {
+            make_stream_handle(50, MockPgOutputProvider::new(batches))
+                .with_transaction_buffer(SMALL_LIMIT, release)
+        }
+
+        /// Past the limit, an open transaction's events are released before its commit,
+        /// without a total, numbered from 0 — and the newest is kept back.
+        ///
+        /// Holding them all until the commit makes memory grow with the transaction: a
+        /// large enough one gets the process killed, and the slot resends it on restart.
+        #[tokio::test]
+        async fn an_open_transaction_past_the_limit_is_released_before_its_commit() {
+            let mut handle = handle(vec![open_transaction()], TransactionRelease::Early);
+            let released = rows_only(handle.next_events(100).await.unwrap());
+
+            assert!(
+                !released.is_empty(),
+                "an open transaction past the limit must not be held until its commit"
+            );
+            assert!(
+                released.len() < 6,
+                "the newest event is kept back for the commit"
+            );
+            for (index, event) in released.iter().enumerate() {
+                let tx = event.transaction.as_ref().expect("transaction metadata");
+                assert_eq!(tx.tx_id, 7);
+                assert_eq!(
+                    tx.total_events, None,
+                    "the total is not known before the commit"
+                );
+                assert_eq!(tx.event_index, index as u32);
+            }
+        }
+
+        /// The events released early and at the commit are one transaction: in order,
+        /// numbered without a gap, and only the last carries the total.
+        #[tokio::test]
+        async fn a_transaction_released_in_parts_is_numbered_once_and_ends_with_its_total() {
+            let mut handle = handle(
+                vec![
+                    open_transaction(),
+                    vec![xlog(900, build_commit(900, 950, 0))],
+                ],
+                TransactionRelease::Early,
+            );
+            let mut events = rows_only(handle.next_events(100).await.unwrap());
+            let early = events.len();
+            events.extend(rows_only(handle.next_events(100).await.unwrap()));
+
+            assert!(
+                early > 0,
+                "part of the transaction is released before its commit"
+            );
+            assert_eq!(
+                ids(&events),
+                ["\"1\"", "\"2\"", "\"3\"", "\"4\"", "\"5\"", "\"6\""]
+            );
+            let indexes: Vec<u32> = events
+                .iter()
+                .map(|event| event.transaction.as_ref().unwrap().event_index)
+                .collect();
+            assert_eq!(indexes, [0, 1, 2, 3, 4, 5]);
+            let totals: Vec<Option<u32>> = events
+                .iter()
+                .map(|event| event.transaction.as_ref().unwrap().total_events)
+                .collect();
+            assert_eq!(
+                totals.last(),
+                Some(&Some(6)),
+                "the last event carries the total"
+            );
+            assert!(
+                totals[..early].iter().all(Option::is_none),
+                "an event released before the commit has no total"
+            );
+        }
+
+        /// An event released before its transaction commits resumes from before the
+        /// transaction's BEGIN, so a restart replays the whole transaction.
+        ///
+        /// Without this, the runtime falls back to the event's own change position, which
+        /// can sit behind an earlier transaction's commit: the checkpoint would move back.
+        #[tokio::test]
+        async fn an_event_released_before_its_commit_resumes_from_before_the_begin() {
+            let mut handle = handle(
+                vec![
+                    open_transaction(),
+                    vec![xlog(900, build_commit(900, 950, 0))],
+                ],
+                TransactionRelease::Early,
+            );
+            let early = rows_only(handle.next_events(100).await.unwrap());
+            assert!(!early.is_empty());
+            let lsn = |value: u64| super::super::parser::format_pg_lsn(value);
+            for event in &early {
+                assert_eq!(
+                    handle.resume_offset_for(event),
+                    Some(lsn(50)),
+                    "an open transaction's event resumes from before its BEGIN"
+                );
+            }
+
+            let rest = rows_only(handle.next_events(100).await.unwrap());
+            for event in &early {
+                assert_eq!(handle.resume_offset_for(event), Some(lsn(50)));
+            }
+            assert_eq!(
+                handle.resume_offset_for(rest.last().expect("the last event")),
+                Some(lsn(950)),
+                "only the last event resumes from the commit"
+            );
+        }
+
+        /// A stream that must keep transactions whole fails at the limit, naming it, rather
+        /// than growing without bound.
+        #[tokio::test]
+        async fn a_whole_transaction_past_the_limit_fails_the_stream() {
+            let mut handle = handle(vec![open_transaction()], TransactionRelease::Whole);
+            let error = handle
+                .next_events(100)
+                .await
+                .expect_err("a transaction that must stay whole cannot outgrow the buffer");
+            let message = error.to_string();
+            assert!(
+                matches!(error, crate::core::Error::Unrecoverable(_)),
+                "retrying replays the same transaction into the same limit: {error:?}"
+            );
+            assert!(message.contains("transaction_buffer_bytes"), "{message}");
+            assert!(
+                message.contains('7'),
+                "the error names the transaction: {message}"
+            );
+        }
+
+        /// One row larger than the limit is past it too: a stream that must keep
+        /// transactions whole fails on it, whatever else the transaction holds.
+        #[tokio::test]
+        async fn a_whole_transaction_of_one_oversized_row_fails_the_stream() {
+            let big = "x".repeat(2_000);
+            let mut handle = handle(
+                vec![vec![
+                    xlog(100, build_relation(OID, "public", "t", &[("id", true)])),
+                    xlog(110, build_relation(OID + 1, "public", "u", &[("id", true)])),
+                    xlog(200, build_begin(900, 0, 7)),
+                    // Rows of an excluded table are never held, so the oversized row is the
+                    // only event the buffer sees.
+                    xlog(210, build_insert(OID + 1, &[Some("1")])),
+                    xlog(220, build_insert(OID, &[Some(big.as_str())])),
+                    xlog(230, build_insert(OID + 1, &[Some("2")])),
+                    xlog(900, build_commit(900, 950, 0)),
+                ]],
+                TransactionRelease::Whole,
+            );
+            handle.table_exclude_list = vec!["public.u".to_string()];
+            let error = handle
+                .next_events(100)
+                .await
+                .expect_err("a single row past the limit is past it");
+            assert!(
+                matches!(error, crate::core::Error::Unrecoverable(_)),
+                "{error:?}"
+            );
+        }
+
+        /// Under the limit, a transaction comes out exactly as before: whole, at its commit.
+        #[tokio::test]
+        async fn a_transaction_under_the_limit_is_released_whole_at_its_commit() {
+            for release in [TransactionRelease::Early, TransactionRelease::Whole] {
+                let mut handle = make_stream_handle(
+                    50,
+                    MockPgOutputProvider::new(vec![
+                        open_transaction(),
+                        vec![xlog(900, build_commit(900, 950, 0))],
+                    ]),
+                )
+                .with_transaction_buffer(1 << 20, release);
+                // Nothing is released for the open transaction, so the poll runs on to its
+                // commit and returns the transaction whole.
+                let events = rows_only(handle.next_events(100).await.unwrap());
+                assert_eq!(events.len(), 6);
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| event.transaction.as_ref().unwrap().total_events == Some(6))
+                );
+            }
+        }
+
+        /// A TRUNCATE of several tables numbers each of its events.
+        #[tokio::test]
+        async fn a_truncate_of_several_tables_numbers_each_event() {
+            let mut truncate = vec![b'T'];
+            truncate.extend_from_slice(&2u32.to_be_bytes());
+            truncate.push(0);
+            truncate.extend_from_slice(&OID.to_be_bytes());
+            truncate.extend_from_slice(&(OID + 1).to_be_bytes());
+            let mut handle = make_stream_handle(
+                50,
+                MockPgOutputProvider::new(vec![vec![
+                    xlog(100, build_relation(OID, "public", "t", &[("id", true)])),
+                    xlog(110, build_relation(OID + 1, "public", "u", &[("id", true)])),
+                    xlog(200, build_begin(900, 0, 7)),
+                    xlog(300, truncate),
+                    xlog(900, build_commit(900, 950, 0)),
+                ]]),
+            );
+            let events = rows_only(handle.next_events(100).await.unwrap());
+            let indexes: Vec<u32> = events
+                .iter()
+                .map(|event| event.transaction.as_ref().unwrap().event_index)
+                .collect();
+            assert_eq!(indexes, [0, 1]);
+        }
     }
 
     /// A standalone event checkpoints at its own position, so a transaction after it must not

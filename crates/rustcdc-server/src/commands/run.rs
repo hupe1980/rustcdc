@@ -139,32 +139,14 @@ async fn run_pipeline(
     .await
 }
 
-#[allow(clippy::too_many_arguments)] // internal wiring of long-lived pipeline components
-async fn run_with_runtime_state(
-    app_config: AppConfig,
-    admin_state: AdminState,
-    transform_pipeline: &transform::TransformPipeline,
-    sink: &mut crate::pipeline::router::TableRouter,
-    admin_exit_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
-    recovered_marker: Option<RecoveredMarkerInfo>,
-    state: crate::state::RuntimeState,
-    sink_metrics: &crate::sink::SinkMetricsRegistry,
-    checkpoint_parity_mode: CheckpointParityMode,
-) -> Result<(), AppError> {
-    let crate::state::RuntimeState {
-        checkpoint,
-        schema_history,
-        checkpoint_age_source,
-        state_lease,
-    } = state;
-
-    if let Some(recovery) = recovered_marker.as_ref() {
-        record_post_recovery_checkpoint_proof(&admin_state, &checkpoint_age_source, recovery).await;
-    }
-
-    let source_config = config::resolve_runtime_source_config(&app_config)?;
-
+/// The runtime's options, as the configuration asks for them.
+fn runtime_options(app_config: &AppConfig) -> Result<RuntimeOptions, AppError> {
     let options = RuntimeOptions::default()
+        // Each batch's records and checkpoint become durable together, so a source must
+        // not deliver part of a transaction: a crash would replay that part.
+        .with_checkpoint_commits_with_batch(
+            app_config.delivery_contract == DeliveryContract::EffectivelyOnce,
+        )
         .with_max_buffer_size(app_config.runtime.max_buffer_size)
         .with_max_poll_wait_ms(app_config.runtime.max_poll_wait_ms)
         .with_checkpoint_interval(std::time::Duration::from_millis(
@@ -254,6 +236,36 @@ async fn run_with_runtime_state(
         options.connection_retry = None;
         options
     };
+
+    Ok(options)
+}
+
+#[allow(clippy::too_many_arguments)] // internal wiring of long-lived pipeline components
+async fn run_with_runtime_state(
+    app_config: AppConfig,
+    admin_state: AdminState,
+    transform_pipeline: &transform::TransformPipeline,
+    sink: &mut crate::pipeline::router::TableRouter,
+    admin_exit_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    recovered_marker: Option<RecoveredMarkerInfo>,
+    state: crate::state::RuntimeState,
+    sink_metrics: &crate::sink::SinkMetricsRegistry,
+    checkpoint_parity_mode: CheckpointParityMode,
+) -> Result<(), AppError> {
+    let crate::state::RuntimeState {
+        checkpoint,
+        schema_history,
+        checkpoint_age_source,
+        state_lease,
+    } = state;
+
+    if let Some(recovery) = recovered_marker.as_ref() {
+        record_post_recovery_checkpoint_proof(&admin_state, &checkpoint_age_source, recovery).await;
+    }
+
+    let source_config = config::resolve_runtime_source_config(&app_config)?;
+
+    let options = runtime_options(&app_config)?;
 
     let runtime_config =
         RuntimeConfig::new(source_config, checkpoint, schema_history).with_options(options);
@@ -964,6 +976,46 @@ pub(crate) mod tests {
         );
     }
 
+    /// Under `effectively_once` a batch's records and its checkpoint become durable
+    /// together, so a large transaction must not reach the sink in parts: a crash would
+    /// replay the part already committed. The runtime keeps it whole.
+    #[test]
+    fn effectively_once_keeps_transactions_whole() {
+        use crate::config::schema::{DeliveryContract, RuntimeTransactionBoundaryPolicy};
+        use rustcdc::TransactionRelease;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let release = |contract, boundary| {
+            let mut config = minimal_config(dir.path().to_path_buf(), StateBackend::LocalFs);
+            config.delivery_contract = contract;
+            config.runtime.transaction_boundary = boundary;
+            super::runtime_options(&config)
+                .expect("options")
+                .transaction_release()
+        };
+        assert_eq!(
+            release(
+                DeliveryContract::AtLeastOnce,
+                RuntimeTransactionBoundaryPolicy::Split
+            ),
+            TransactionRelease::Early
+        );
+        assert_eq!(
+            release(
+                DeliveryContract::EffectivelyOnce,
+                RuntimeTransactionBoundaryPolicy::Split
+            ),
+            TransactionRelease::Whole
+        );
+        assert_eq!(
+            release(
+                DeliveryContract::AtLeastOnce,
+                RuntimeTransactionBoundaryPolicy::PreserveTransactions
+            ),
+            TransactionRelease::Whole
+        );
+    }
+
     /// Also used by `delivery_contract_tests`, which needs a valid `AppConfig` to
     /// build a real router, admin state and state backend.
     pub(crate) fn minimal_config(
@@ -997,6 +1049,8 @@ pub(crate) mod tests {
             stream_buffer_memory_bytes:
                 rustcdc::PostgresSourceConfig::default_stream_buffer_memory_bytes(),
             stream_spill_directory: None,
+            transaction_buffer_bytes:
+                rustcdc::PostgresSourceConfig::default_transaction_buffer_bytes(),
         };
         AppConfig {
             api_version: AppConfig::SUPPORTED_API_VERSION.to_string(),

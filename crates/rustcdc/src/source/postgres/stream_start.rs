@@ -155,6 +155,7 @@ pub(super) async fn start_postgres_stream(
                     publication_name: stream.publication_name.clone(),
                     confirmed_lsn: initial_confirmed_lsn,
                     capture_logical_messages: connection.config.capture_logical_messages,
+                    transaction_buffer_bytes: connection.config.transaction_buffer_bytes,
                 })
             }
         };
@@ -173,6 +174,10 @@ pub(super) async fn start_postgres_stream(
             reselect_client,
         )
         .with_resume_floor(resume_floor)
+        .with_transaction_buffer(
+            connection.config.transaction_buffer_bytes,
+            connection.transaction_release,
+        )
         .with_slot_state_sample_interval_ms(connection.config.slot_state_sample_interval_ms)
         .with_relation_catalog(Box::new(relation_catalog)),
     ))
