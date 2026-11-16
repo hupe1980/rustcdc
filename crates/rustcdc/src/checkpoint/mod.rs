@@ -2237,38 +2237,38 @@ mod tests {
         assert!(matches!(error, crate::core::Error::CheckpointError(_)));
     }
 
-    /// PID 1 (init/launchd) is always alive on Unix; a lease file claiming
-    /// ownership by PID 1 should trigger a conflict error because the process
-    /// is running and the current process is not PID 1.
+    /// A running owner holds the lease's lock: refused, whatever its sentinel names.
     #[tokio::test]
-    #[cfg(unix)]
-    async fn file_checkpoint_rejects_owner_lease_conflict_from_live_pid() {
+    async fn file_checkpoint_rejects_owner_lease_conflict_from_a_running_owner() {
         let dir = tempdir().unwrap();
         let lock_path = dir
             .path()
             .join(super::FileCheckpointInner::OWNER_LEASE_FILENAME);
-        // PID 1 (init/launchd) is always alive. Use HOSTNAME:PID format.
-        let lease = crate::checkpoint::owner_lease::format_lease(
-            crate::checkpoint::owner_lease::current_hostname(),
-            1,
-        );
-        std::fs::write(&lock_path, lease.as_bytes()).unwrap();
+        std::fs::write(&lock_path, "other-host:1").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.path().join(format!(
+                "{}.lock",
+                super::FileCheckpointInner::OWNER_LEASE_FILENAME
+            )))
+            .unwrap();
+        held.try_lock().unwrap();
 
         let checkpoint = FileCheckpoint::new(dir.path());
         let error = checkpoint.get_committed_count().await.unwrap_err();
         assert!(matches!(error, crate::core::Error::CheckpointError(_)));
     }
 
-    /// A lease file claiming ownership by a PID that no longer exists should
-    /// be auto-cleared so the new process can start without manual intervention.
+    /// A crashed owner's sentinel, with nothing holding the lock, is taken over without
+    /// manual intervention.
     #[tokio::test]
-    #[cfg(unix)]
     async fn file_checkpoint_recovers_from_stale_owner_lease_of_dead_process() {
         let dir = tempdir().unwrap();
         let lock_path = dir
             .path()
             .join(super::FileCheckpointInner::OWNER_LEASE_FILENAME);
-        // PID u32::MAX is extremely unlikely to be alive. Use HOSTNAME:PID format.
         let stale_lease = crate::checkpoint::owner_lease::format_lease(
             crate::checkpoint::owner_lease::current_hostname(),
             u32::MAX,
@@ -2279,7 +2279,6 @@ mod tests {
         // Should succeed: stale lease auto-cleared.
         let count = checkpoint.get_committed_count().await.unwrap();
         assert_eq!(count, 0);
-        // Lock file should now contain the current process in HOSTNAME:PID format.
         let contents = std::fs::read_to_string(&lock_path).unwrap();
         let (host, pid) = crate::checkpoint::owner_lease::parse_lease(&contents).unwrap();
         assert_eq!(host, crate::checkpoint::owner_lease::current_hostname());

@@ -1234,26 +1234,19 @@ current owner. A crashed owner's lease expires by itself after 60 s, so recovery
 no manual step.
 
 **`local_fs`: the lock and the lease.** The owner holds an advisory lock on
-`owner_lease.lock` in the state directory for as long as it runs; the kernel releases it
-when the process exits, however it exits.
+`owner_lease.lock` in the state directory while it runs; the kernel releases it however the
+process exits. Its lease records where that lock lives: the kernel's boot id and the
+filesystem's device.
 
-- **On a local path the lock decides.** A second process that cannot take it is refused,
-  even if the owner is idle and its lease looks old. The owner records in its lease where
-  its lock is visible: the kernel (`/proc/sys/kernel/random/boot_id`, which every container
-  on a host shares) and the filesystem's device number. A process that takes the lock and
-  finds a live lease recorded in that same place replaces the crashed owner at once. This
-  holds whatever the PIDs are, so a container restarted after a crash (PID 1 before and
-  after) starts immediately, and it needs no external program.
-- **Otherwise the lease decides.** An owner on another kernel, or one that locked through
-  another mount of a network directory, may hold a lock this process is never told about,
-  so its live lease is authoritative until it expires: a crashed owner there blocks a
-  successor for up to 60 s. The same holds for an owner whose filesystem refused the lock
-  (logged as a warning): its lease records no lock. The lease is renewed on a timer, so an
-  idle owner keeps it.
-- *Limits:* off Linux there is no boot id, and a lease written by a version that does not
-  record the lock's place is judged by its TTL once, at upgrade. The immediate takeover
-  assumes that two openers on one kernel that see one device number share its locks. The
-  lock is advisory: it does not stop another program from writing the directory.
+- **Same kernel and device: the lock decides.** Held: a running owner, refused even when idle.
+  Free: the owner crashed and is replaced at once, whatever its PID (a restarted container is
+  PID 1 both times).
+- **Anywhere else: the lease decides.** Another kernel or another mount of a network volume may
+  hold a lock this process cannot see, so a live lease blocks a successor until it expires
+  (60 s). So does a lease from an owner whose filesystem refused the lock. The lease is renewed
+  on a timer, so an idle owner keeps it.
+- *Limits:* off Linux there is no boot id, so the lease always decides. The lock is advisory: it
+  does not stop another program writing the directory.
 
 **Caveat for `redis` / `postgresql`:** acquisition is read-then-write, not
 compare-and-swap, because OpenDAL exposes no uniform CAS across those services. Two

@@ -1,13 +1,6 @@
 //! Core crate surface for rustcdc.
 
-// `deny`, not `forbid`: the Windows PID-liveness probe in
-// `checkpoint::owner_lease` needs a single, tightly-scoped `unsafe` block for the
-// Win32 `OpenProcess`/`GetExitCodeProcess` FFI. `forbid` cannot be locally
-// overridden, so it made the crate impossible to compile for `*-pc-windows-*`
-// targets — invisibly, because CI only builds Linux and macOS. Every other module
-// remains unsafe-free, and each exception must carry an explicit
-// `#[allow(unsafe_code)]` with a safety comment.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // Every public item carries documentation, and the lint keeps it that way.
 //
 // This is a library whose public surface *is* the product: an undocumented `pub fn` on a

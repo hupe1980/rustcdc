@@ -106,7 +106,7 @@ Three ways these mislead:
 ## Do not
 
 - Add a Git dependency — it makes the crate unpublishable.
-- Add `unsafe` outside the two allowlisted sites (`crates/rustcdc-server/tests/architecture.rs`
+- Add `unsafe` outside the allowlisted site (`crates/rustcdc-server/tests/architecture.rs`
   holds the list).
 - Relax a safety check silently. Change the policy and its CI guard together.
 - Introduce deprecated APIs or usage patterns.

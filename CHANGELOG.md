@@ -5,7 +5,63 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
-## Unreleased
+## 0.23.2
+
+A crashed owner of a state directory is replaced at once, and a running one is refused, in the
+server's `local_fs` store and in the library's `FileCheckpoint` and `FileSchemaHistory` alike: an
+advisory lock decides, not a process probe. Upgrade if you run the server on `local_fs`, the
+default, or embed the file stores.
+
+### Fixed: `local_fs` ownership (#36)
+
+- **A second process is refused**, by an advisory lock the owner holds for its lifetime. The
+  check it replaces ran `kill`, which the distroless image does not ship, so in the image a second
+  instance on the same state directory was not reliably refused, and two instances interleave one
+  pipeline's checkpoints.
+- **A crashed owner is replaced at once** on the same host, whatever its PID: a container
+  restarted after a crash (PID 1 before and after) no longer waits out the 60-second lease.
+- **An idle owner keeps its lease**: it is renewed on a timer, not only when a checkpoint is
+  written, so a second instance cannot take over a quiet pipeline after 60 s.
+- Off the lock's reach (another kernel, another mount of a network volume, a filesystem that
+  refuses locks) the lease decides, as before. See
+  [Configuration](site/content/docs/configuration.md).
+- *Evidence*: a restarted owner with its predecessor's own PID is taken over at once; a running
+  owner whose lease is backdated past its TTL is still refused; a second process with no `kill`
+  binary is refused; an idle owner renews across three heartbeats. Each failed on 0.23.1. Thanks
+  to @vu2jpr (#47).
+
+### Fixed: the library's file stores recover from a crash in a container
+
+`FileCheckpoint` and `FileSchemaHistory` (and so the server's `local_fs`, which uses them) took
+an owner lease that recorded `HOSTNAME:PID` and judged it with `ps`. A crashed owner in a
+replaced container, with another hostname, was refused on every later start until someone
+deleted the lease file; with no `ps` on the path, as in the image, so was a crashed owner on the
+same host with another PID.
+
+- The owner now holds an advisory lock beside the lease for its lifetime. Held: a running owner,
+  refused. Free: the owner is gone, and is taken over whatever host or PID it named.
+- The check before every durable write still fences a displaced owner, which is what keeps two
+  hosts apart on a filesystem that does not share locks.
+- On a filesystem that refuses locks, a lease naming another owner is refused with the file to
+  delete.
+- The library no longer contains `unsafe`, and now forbids it: the Windows process probe is gone.
+- *Evidence*: a lease left by another container (`old-container-hostname:1`) failed to be taken
+  over on 0.23.1 and is now, in the library and in a server `local_fs` directory
+  (`a_replaced_containers_checkpoint_lease_is_taken_over`); a running owner holding the lock is
+  still refused; dropping the lease releases its lock. The PostgreSQL process-crash suite (7) and
+  the server's PostgreSQL suite (9) pass against containers. Planted, each fails a test: a held lock treated as free, and a lock not kept
+  after acquiring.
+
+### Upgrading
+
+- **The first restart after upgrading may wait up to 60 s once** on `local_fs`: a lease written by
+  0.23.1 records no lock, so it is judged by its TTL.
+- **A file-store lease from another host is no longer refused for good**: if nothing holds its
+  lock, it is taken over, with a warning naming it. Keep one directory per runtime instance, as
+  before; on a shared filesystem without lock support, the write fence is what stops the older owner.
+- The `another cdc-server process (PID N) is already running` error is now
+  `another rustcdc process is already running against state directory`; there is no stale lock
+  file to remove any more. See the [runbook](site/content/docs/runbook.md).
 
 ### Changed: faster CI, one local gate, and a release check
 
@@ -21,8 +77,8 @@ what breaks and what to do about it.
 - **CI:** only `main` writes caches, so a pull request's no longer evict the ones every run reads;
   the release evidence runs on main only, where the release reads it; the fuzz job is cached.
 - **SQL Server suites** start once SQL Server has finished starting ("Recovery is complete"), not
-  when it first listens: a suite that connected in between was refused for longer than its retries
-  on a loaded runner.
+  when it first listens. A server that crashes during startup, as it does now and then on a shared
+  runner, fails the suite at startup with its log, not later as a refused connection.
 - *Evidence*: a fresh worktree without the console built the server twice, recompiling it each
   time, and now builds nothing the second time; with the `ui/dist` half reverted it recompiles
   again. A test file planted over its line budget fails `cargo xtask gate` at `server`. With the wait

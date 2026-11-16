@@ -1,26 +1,22 @@
-//! PID-based exclusive-ownership lease for single-writer file stores.
+//! Exclusive ownership for single-writer file stores.
 //!
-//! [`OwnerLease`] writes `HOSTNAME:PID` into a sentinel file and refuses to
-//! acquire the lease if another live process already holds it.  Stale leases
-//! left by dead processes on the **same host** are cleared automatically so
-//! manual recovery is not required after a crash.
+//! The owner holds an advisory lock on `<sentinel>.lock` for the lease's lifetime, and the
+//! sentinel records `HOSTNAME:PID`. The kernel releases the lock when its holder exits,
+//! however it exits, so the lock decides:
 //!
-//! # Cross-host (NFS) safety
+//! - **Held by someone else**: a running owner. Refused.
+//! - **Free**: whoever the sentinel names is gone (a crash, a replaced container with another
+//!   hostname, a restart with another PID), so it is taken over. No process table is read
+//!   and no external program runs.
+//! - **The filesystem refuses locks**: a sentinel naming another owner is refused, with the
+//!   file to delete if that owner is gone; nothing here can tell.
 //!
-//! The lease file stores both the hostname and the PID.  When the hostname in
-//! the existing lease does not match the current host the lease is treated as
-//! **held** — the runtime refuses to take ownership.  This prevents a second
-//! container on a different host from incorrectly reclaiming a lease because
-//! PID `1234` does not exist in *its* process table.
+//! A filesystem that does not share locks between hosts cannot keep two hosts apart. There
+//! the sentinel fences: before every durable write the owner checks the sentinel still holds
+//! its token, so a displaced owner stops at its next write.
 //!
-//! **`FileCheckpoint` and `FileSchemaHistory` are still not safe for
-//! concurrent use from multiple hosts.**  Use a dedicated directory per
-//! runtime instance.  The hostname check only prevents silent data corruption;
-//! it does not provide true distributed mutual exclusion.
-//!
-//! Both [`super::FileCheckpoint`] and
-//! [`crate::schema_history::FileSchemaHistory`] use this type so the logic
-//! stays in one place.
+//! **`FileCheckpoint` and `FileSchemaHistory` are not for concurrent use from several hosts.**
+//! Use a dedicated directory per runtime instance.
 
 use std::{
     fs::{self, OpenOptions},
@@ -45,6 +41,8 @@ pub(crate) struct OwnerLease {
     /// Held so [`OwnerLease::verify_still_held`] can fence writes: a lease that was
     /// acquired successfully is not thereby held *forever*.
     token: String,
+    /// The lock that makes this process the owner; `None` where the filesystem refuses locks.
+    lock: Option<fs::File>,
 }
 
 impl OwnerLease {
@@ -97,6 +95,11 @@ impl Drop for OwnerLease {
         let remaining = decrement_lease_ref(&self.lock_path);
         if remaining == 0 {
             let _ = fs::remove_file(&self.lock_path);
+        }
+        // Explicitly, not by closing: a child process holds a copy of the lock's file
+        // description from its creation until it execs, and would keep the lock held.
+        if let Some(lock) = self.lock.take() {
+            let _ = lock.unlock();
         }
     }
 }
@@ -163,11 +166,10 @@ pub(crate) fn format_lease(hostname: &str, pid: u32) -> String {
 
 /// Parse a lease token in `HOSTNAME:PID` format.
 ///
-/// Returns `None` when the content is empty or malformed (e.g., an old
-/// single-integer lease written by a previous version of rustcdc).
+/// Returns `None` when the content is empty or malformed.
+#[cfg(test)]
 pub(crate) fn parse_lease(contents: &str) -> Option<(String, u32)> {
     let contents = contents.trim();
-    // New format: `HOSTNAME:PID`
     if let Some(colon) = contents.rfind(':') {
         let host = &contents[..colon];
         let pid_str = &contents[colon + 1..];
@@ -182,24 +184,6 @@ pub(crate) fn parse_lease(contents: &str) -> Option<(String, u32)> {
 
 // ─── Acquire ────────────────────────────────────────────────────────────────
 
-/// Try to acquire an exclusive owner lease at `lock_path`.
-///
-/// The lease file stores `HOSTNAME:PID` so that cross-host conflicts on shared
-/// network paths are detected and refused rather than silently stolen.
-///
-/// Decision table for an existing lease file:
-///
-/// | Lease hostname | Lease PID      | Action                        |
-/// |----------------|----------------|-------------------------------|
-/// | current host   | current PID    | Re-entrant — succeed          |
-/// | current host   | dead process   | Clear stale lease and succeed |
-/// | current host   | live process   | Refuse (conflict)             |
-/// | different host | any            | Refuse (cross-host conflict)  |
-/// | unreadable     | —              | Refuse (conservative)         |
-///
-/// `store_label` is used only in error messages (e.g. `"checkpoint"`,
-/// `"schema_history"`).
-///
 /// Atomically replace (or create) `lock_path` with `content`.
 ///
 /// Writes to a sibling temp file then renames over `lock_path`.  On POSIX,
@@ -243,12 +227,9 @@ pub(crate) fn atomic_write_lease(lock_path: &Path, content: &str) -> std::io::Re
 
 /// Reject a second in-process holder of the same lease path.
 ///
-/// The on-disk check cannot catch this: a second `FileCheckpoint` or
-/// `FileSchemaHistory` constructed against the same directory in the same process
-/// writes the same `HOSTNAME:PID`, so the file-based decision table classifies it as
-/// a **re-entrant** acquire and lets it through. Both instances then hold independent
-/// in-memory state and rewrite the whole file, silently destroying each other's
-/// records — reproducibly, with no error anywhere.
+/// Checked before the lock so the error says what happened: a second `FileCheckpoint` or
+/// `FileSchemaHistory` on the same directory in the same process would hold independent
+/// in-memory state and rewrite the whole file, destroying the other's records.
 ///
 /// Instances are sequential-safe: `Drop` decrements the count, so constructing one
 /// after another has been dropped is fine. Clones share a single `OwnerLease` and
@@ -289,186 +270,92 @@ pub(crate) fn acquire(lock_path: &Path, store_label: &str) -> Result<OwnerLease>
 }
 
 fn acquire_on_disk(lock_path: &Path, store_label: &str) -> Result<OwnerLease> {
-    let owner_pid = std::process::id();
-    let hostname = current_hostname();
+    let parent_dir = lock_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let existing = fs::read_to_string(lock_path)
+        .ok()
+        .map(|raw| raw.trim().to_owned())
+        .filter(|raw| !raw.is_empty());
 
-    // Warn when hostname resolution fell back to "unknown". Two processes on
-    // different hosts that both fail hostname resolution will write identical
-    // lease tokens — defeating the cross-host safety guarantee.
-    if hostname == "unknown" {
+    let lock = match try_lock(&lock_file_for(lock_path))? {
+        TryLock::Held(file) => Some(file),
+        TryLock::Busy => {
+            return Err(Error::StateError(format!(
+                "{store_label} owner lease conflict for '{parent_dir}': a running process \
+                 holds it ({}). Use a dedicated {store_label} directory per runtime instance.",
+                existing.as_deref().unwrap_or("owner unknown"),
+            )));
+        }
+        TryLock::Unsupported(error) => {
+            tracing::warn!(
+                target: "rustcdc::owner_lease",
+                store_label,
+                store_dir = %parent_dir,
+                error = %error,
+                "the filesystem refused an advisory lock; the {store_label} owner lease \
+                 cannot tell a crashed owner from a running one here"
+            );
+            None
+        }
+    };
+
+    let token = format_lease(current_hostname(), std::process::id());
+    if let Some(previous) = existing.filter(|previous| *previous != token) {
+        if lock.is_none() {
+            return Err(Error::StateError(format!(
+                "{store_label} owner lease conflict for '{parent_dir}': held by '{previous}', \
+                 and this filesystem refuses locks, so whether it is still running cannot be \
+                 told. If it is not, delete '{}' and retry.",
+                lock_path.display(),
+            )));
+        }
         tracing::warn!(
             target: "rustcdc::owner_lease",
             store_label,
-            store_dir = %lock_path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
-            "hostname resolved to 'unknown' (HOSTNAME env var unset and `hostname` command failed); \
-             cross-host exclusive-write guarantee is degraded — two processes on different hosts may \
-             both acquire the same lease. Use a dedicated {store_label} directory per runtime instance \
-             or set the HOSTNAME environment variable explicitly.",
+            store_dir = %parent_dir,
+            previous_owner = %previous,
+            "taking over a {store_label} owner lease whose owner no longer holds its lock"
         );
     }
-
-    let lease_content = format_lease(hostname, owner_pid);
-
-    let create_result = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(lock_path);
-
-    match create_result {
-        Ok(mut lock_file) => {
-            lock_file
-                .write_all(lease_content.as_bytes())
-                .map_err(Error::from)?;
-            lock_file.sync_all().map_err(Error::from)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let raw = fs::read_to_string(lock_path).unwrap_or_default();
-            let existing = parse_lease(&raw);
-            let parent_dir = lock_path
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-
-            match existing {
-                Some((ref host, pid)) if host == hostname && pid == owner_pid => {
-                    // Current process already owns the lease (re-entrant acquire).
-                }
-                Some((ref host, pid)) if host == hostname && !is_pid_alive(pid) => {
-                    tracing::warn!(
-                        target: "rustcdc::owner_lease",
-                        store_label,
-                        store_dir = %parent_dir,
-                        stale_owner_pid = pid,
-                        "clearing stale {store_label} owner lease left by dead process"
-                    );
-                    // Atomically replace the stale lease using write-to-temp + rename.
-                    // This eliminates the TOCTOU window between `remove` and `create_new`.
-                    atomic_write_lease(lock_path, &lease_content).map_err(Error::from)?;
-
-                    // Post-rename race check: POSIX rename(2) is atomic but not exclusive.
-                    // Two processes that both observe the same dead PID can race through
-                    // atomic_write_lease; the last rename wins. Re-read and verify that
-                    // our own hostname:PID is in the file before proceeding as owner.
-                    let winner = fs::read_to_string(lock_path).unwrap_or_default();
-                    if parse_lease(&winner) != Some((hostname.to_owned(), owner_pid)) {
-                        return Err(Error::StateError(format!(
-                            "{store_label} owner lease conflict for '{parent_dir}': \
-                             lost stale-lease takeover race to a concurrent process. \
-                             Retry, or use a dedicated {store_label} directory per runtime instance."
-                        )));
-                    }
-                }
-                Some((ref host, pid)) if host != hostname => {
-                    // Different host — do NOT attempt liveness check: the PID namespace
-                    // is not shared between hosts.  Refuse to prevent cross-host corruption
-                    // on shared NFS paths.
-                    tracing::error!(
-                        target: "rustcdc::owner_lease",
-                        store_label,
-                        store_dir = %parent_dir,
-                        lease_host = %host,
-                        lease_pid = pid,
-                        current_host = %hostname,
-                        "{store_label} owner lease is held by a different host '{host}' (pid {pid}). \
-                         FileCheckpoint/FileSchemaHistory are not safe for concurrent cross-host access. \
-                         Use a dedicated directory per runtime instance."
-                    );
-                    return Err(Error::StateError(format!(
-                        "{store_label} owner lease conflict for '{parent_dir}': \
-                         held by host '{host}' pid {pid} — cross-host NFS sharing is not supported. \
-                         Use a dedicated {store_label} directory per runtime instance."
-                    )));
-                }
-                _ => {
-                    return Err(Error::StateError(format!(
-                        "{store_label} owner lease conflict for '{parent_dir}': \
-                         lock is held by another process. \
-                         Use a dedicated {store_label} directory per runtime instance."
-                    )));
-                }
-            }
-        }
-        Err(error) => return Err(Error::from(error)),
-    }
+    atomic_write_lease(lock_path, &token).map_err(Error::from)?;
 
     Ok(OwnerLease {
         lock_path: lock_path.to_path_buf(),
-        token: lease_content,
+        token,
+        lock,
     })
 }
 
-// ─── PID liveness ───────────────────────────────────────────────────────────
-
-/// Check whether a process with the given PID is currently alive **on this host**.
-///
-/// Uses `ps -p <pid>` which exits 0 when the PID exists (regardless of
-/// permissions to signal it) and exits non-zero when the PID is absent.
-/// This correctly distinguishes ESRCH (dead) from EPERM (alive but
-/// unowned) — unlike `kill -0` which returns non-zero for both.
-///
-/// **Only call this for PIDs known to belong to the current host.**
-///
-/// On non-Unix platforms, conservatively returns `true` to avoid
-/// accidentally clearing leases held by live processes.
-pub(crate) fn is_pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        std::process::Command::new("ps")
-            .args(["-p", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(true) // conservatively assume alive on error
-    }
-    #[cfg(windows)]
-    {
-        // Use OpenProcess with SYNCHRONIZE (0x00100000) to probe existence.
-        // Returns a non-null handle when the PID exists (even without full access).
-        // Falls back to conservatively assuming alive on unexpected errors.
-        // `unsafe extern` is required by Rust 2024: declaring a foreign signature is
-        // itself the unsafe act, because nothing checks it against the real symbol.
-        #[allow(unsafe_code)]
-        unsafe extern "system" {
-            fn OpenProcess(
-                dwDesiredAccess: u32,
-                bInheritHandle: i32,
-                dwProcessId: u32,
-            ) -> *mut std::ffi::c_void;
-            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-            fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
-        }
-        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-        const STILL_ACTIVE: u32 = 259;
-        // SAFETY: `OpenProcess` returns either null or a valid process handle. We
-        // check for null before use, pass a valid `&mut u32` out-parameter to
-        // `GetExitCodeProcess`, and `CloseHandle` the handle exactly once on every
-        // path that obtained it. No pointer outlives this block.
-        #[allow(unsafe_code)]
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle.is_null() {
-                // GetLastError() == ERROR_INVALID_PARAMETER (87) means no such PID.
-                return false;
-            }
-            let mut exit_code: u32 = 0;
-            let ok = GetExitCodeProcess(handle, &mut exit_code);
-            CloseHandle(handle);
-            if ok == 0 {
-                return true; // conservatively alive on query error
-            }
-            exit_code == STILL_ACTIVE
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        true
-    }
+/// The lock file beside a sentinel: `<sentinel>.lock`. Never removed: deleting a lock file
+/// races a successor that already opened it.
+fn lock_file_for(sentinel: &Path) -> PathBuf {
+    let mut path = sentinel.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
-// ─── Unit tests ─────────────────────────────────────────────────────────────
+enum TryLock {
+    Held(fs::File),
+    Busy,
+    Unsupported(std::io::Error),
+}
+
+fn try_lock(path: &Path) -> Result<TryLock> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(Error::from)?;
+    match file.try_lock() {
+        Ok(()) => Ok(TryLock::Held(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(TryLock::Busy),
+        Err(fs::TryLockError::Error(error)) => Ok(TryLock::Unsupported(error)),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -541,21 +428,47 @@ mod tests {
         assert!(!lock_path.exists());
     }
 
-    /// A lease held by a live PID must be refused.
-    #[cfg(unix)]
+    /// A running owner holds the lock: refused, whatever its sentinel says.
     #[test]
-    fn acquire_refuses_live_pid_lease() {
+    fn a_running_owner_holding_the_lock_is_refused() {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("test.owner");
-        // PID 1 (init/launchd) is always alive.
-        let live_lease = format_lease(current_hostname(), 1);
-        std::fs::write(&lock_path, live_lease.as_bytes()).unwrap();
-        let result = acquire(&lock_path, "test");
-        assert!(result.is_err(), "expected conflict error for live PID");
+        std::fs::write(&lock_path, "other-host:4242").unwrap();
+        let held = match try_lock(&lock_file_for(&lock_path)).unwrap() {
+            TryLock::Held(file) => file,
+            _ => panic!("the test must hold the lock"),
+        };
+        let error = acquire(&lock_path, "test").unwrap_err();
+        assert!(
+            error.to_string().contains("a running process holds it"),
+            "{error}"
+        );
+        // Explicitly: a child another test forks holds a copy until it execs.
+        held.unlock().unwrap();
+        assert!(
+            acquire(&lock_path, "test").is_ok(),
+            "free once its holder is gone"
+        );
     }
 
-    /// A stale (dead-process) lease must be auto-cleared and the caller takes ownership.
-    #[cfg(unix)]
+    /// Dropping the lease releases its lock, so a successor is admitted at once.
+    #[test]
+    fn dropping_the_lease_releases_its_lock() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("test.owner");
+        let lease = acquire(&lock_path, "test").unwrap();
+        assert!(matches!(
+            try_lock(&lock_file_for(&lock_path)).unwrap(),
+            TryLock::Busy
+        ));
+        drop(lease);
+        assert!(matches!(
+            try_lock(&lock_file_for(&lock_path)).unwrap(),
+            TryLock::Held(_)
+        ));
+    }
+
+    /// A crashed owner on this host leaves its sentinel and no lock: taken over.
     #[test]
     fn acquire_clears_stale_dead_pid_lease() {
         let dir = tempdir().unwrap();
@@ -570,78 +483,20 @@ mod tests {
         drop(lease);
     }
 
-    /// `acquire()` exercises the post-rename check on the winner (success) path:
-    /// the process clears a stale dead-PID lease, atomically renames its own
-    /// content into place, re-reads, and confirms the file contains its own
-    /// `HOSTNAME:PID` before returning `OwnerLease`.
-    ///
-    /// This test verifies that the post-rename check code path is actually
-    /// reached and passes when the current process wins the rename race.
-    ///
-    /// The *loser* path (another process overwrites the file between our rename
-    /// and our re-read) cannot be exercised deterministically in a single-process
-    /// unit test — that scenario requires two real processes racing at the OS
-    /// rename layer and is covered at the integration level.
-    #[cfg(unix)]
+    /// What a crashed owner in a replaced container leaves behind: its own hostname, PID 1.
+    /// Nothing holds the lock, so the owner is gone, whatever the sentinel names.
     #[test]
-    fn acquire_winner_path_exercises_post_rename_check() {
+    fn a_lease_left_by_another_container_is_taken_over() {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("test.owner");
-
-        // Precondition: stale dead-process lease is present.
-        let stale = format_lease(current_hostname(), u32::MAX);
-        std::fs::write(&lock_path, stale.as_bytes()).unwrap();
-
-        // acquire() must: (a) detect the dead PID, (b) call atomic_write_lease,
-        // (c) re-read and confirm HOSTNAME:PID is ours, (d) return Ok(OwnerLease).
-        let lease = acquire(&lock_path, "test")
-            .expect("acquire should succeed when clearing a stale dead-PID lease");
-
-        // Post-condition: the file contains exactly our hostname and PID, proving
-        // the post-rename check ran and confirmed the winner state.
+        std::fs::write(&lock_path, "old-container-hostname:1").unwrap();
+        let lease = acquire(&lock_path, "test").expect("nothing holds the lock");
         let contents = std::fs::read_to_string(&lock_path).unwrap();
-        let (host, pid) = parse_lease(&contents)
-            .expect("lease file must contain a valid HOSTNAME:PID after acquire");
-        assert_eq!(host, current_hostname(), "lease hostname must be ours");
-        assert_eq!(pid, std::process::id(), "lease PID must be ours");
-
-        drop(lease); // RAII cleanup removes the lock file
-        assert!(
-            !lock_path.exists(),
-            "lock file should be removed when the last OwnerLease is dropped"
-        );
-    }
-
-    /// Validates the `parse_lease` comparison logic used by the post-rename race
-    /// check inside `acquire()`.
-    ///
-    /// Specifically: a lease token containing a *foreign* PID must not compare
-    /// equal to `Some((current_hostname(), current_pid))`, while a token
-    /// containing our own hostname and PID must.  This is the predicate
-    /// `acquire()` evaluates after the atomic rename to decide whether it won
-    /// or lost the takeover race.
-    ///
-    /// This test exercises the predicate in isolation; the full `acquire()` code
-    /// path for the winner case is covered by
-    /// `acquire_winner_path_exercises_post_rename_check`.
-    #[cfg(unix)]
-    #[test]
-    fn post_rename_check_predicate_accepts_own_pid_rejects_foreign() {
-        let our_content = format_lease(current_hostname(), std::process::id());
-        let foreign_content = format_lease(current_hostname(), u32::MAX);
-
-        // Our own hostname:PID passes the check.
         assert_eq!(
-            parse_lease(&our_content),
-            Some((current_hostname().to_owned(), std::process::id())),
-            "own lease token must parse to (our_hostname, our_pid)"
+            parse_lease(&contents),
+            Some((current_hostname().to_owned(), std::process::id()))
         );
-        // A foreign PID fails the check — the process would correctly return Err.
-        assert_ne!(
-            parse_lease(&foreign_content),
-            Some((current_hostname().to_owned(), std::process::id())),
-            "foreign lease token must not match (our_hostname, our_pid)"
-        );
+        drop(lease);
     }
 
     #[test]
@@ -653,10 +508,8 @@ mod tests {
 
     #[test]
     fn a_second_instance_in_this_process_is_refused() {
-        // Regression: the on-disk decision table classifies a second instance in the
-        // same process as a *re-entrant* acquire (same HOSTNAME:PID), so both used to
-        // succeed. Each then rewrote the whole store file from its own in-memory
-        // state, silently destroying the other's records.
+        // Each instance would rewrite the whole store file from its own in-memory state,
+        // destroying the other's records.
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("second.owner");
 
@@ -678,14 +531,18 @@ mod tests {
     fn a_rejected_acquire_does_not_poison_the_path() {
         let dir = tempdir().unwrap();
         let lock_path = dir.path().join("poison.owner");
-        // A foreign live-host lease makes the on-disk acquire fail.
-        std::fs::write(&lock_path, format_lease("some-other-host", 4242)).unwrap();
+        // A held lock makes the on-disk acquire fail.
+        let held = match try_lock(&lock_file_for(&lock_path)).unwrap() {
+            TryLock::Held(file) => file,
+            _ => panic!("the test must hold the lock"),
+        };
 
         assert!(acquire(&lock_path, "checkpoint").is_err());
 
         // The in-process reservation must have been released, so a later attempt is
         // judged on its own merits rather than inheriting the failed one.
-        std::fs::remove_file(&lock_path).unwrap();
+        // Explicitly: a child another test forks holds a copy until it execs.
+        held.unlock().unwrap();
         acquire(&lock_path, "checkpoint").expect("path must not be poisoned by the failure");
     }
 

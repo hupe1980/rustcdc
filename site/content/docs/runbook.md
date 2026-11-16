@@ -99,11 +99,10 @@ cat <state-dir>/.cdc-server.lock   # the PID of the process holding it
 ### `<backend> state is already owned by '<host:pid:nonce>'`
 
 Owner lease for the `local_fs`, `redis` and `postgresql` state backends. Another instance
-holds it. For `local_fs` that instance is either running (it holds the directory's lock), or its
-lease records no lock this process can check: it ran on another kernel or another mount of
-the volume, its filesystem refused the lock, or it was written before the lease recorded
-the lock. Such a lease blocks a successor until it expires (60 s). A crashed owner whose
-lock was in the same place as ours is replaced at once and does not produce this error.
+holds it. For `local_fs` that instance is either running (it holds the directory's lock), or
+its lock is somewhere this process cannot check (another kernel, another mount of the volume,
+a filesystem that refused locks), and its lease blocks a successor until it expires (60 s). A
+crashed owner on the same kernel and device is replaced at once and never produces this error.
 
 **The overwhelmingly common cause is a Kubernetes rolling update.** A `Deployment`
 without `strategy: Recreate` starts the new pod before stopping the old one, so both
